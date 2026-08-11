@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from operator import index
 from pathlib import Path
 
 import torch
@@ -129,8 +130,12 @@ class DACVAECodec:
                 continue
             for name in ("hop_length", "hop_size"):
                 value = getattr(module, name, None)
-                if isinstance(value, int) and value > 0:
-                    return value
+                try:
+                    hop_length = index(value)
+                except TypeError:
+                    continue
+                if hop_length > 0:
+                    return hop_length
         raise ValueError("DACVAE model does not expose a positive hop_length/hop_size.")
 
     @staticmethod
