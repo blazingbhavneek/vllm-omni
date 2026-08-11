@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Callable, Hashable
 from dataclasses import fields
 
 from vllm.config import VllmConfig
@@ -16,6 +17,7 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.registry import get_diffusion_step_batch_key_func
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionRequestStatus,
@@ -36,7 +38,8 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
-    "lora_int_id"
+    "lora_int_id",
+    "model_key",
 }
 
 
@@ -54,6 +57,7 @@ class BaseScheduler(ABC):
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
+        self._step_batch_model_key_func: Callable[[OmniDiffusionRequest], Hashable] | None = None
 
     def initialize(
         self,
@@ -108,6 +112,7 @@ class BaseScheduler(ABC):
             ):
                 raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
             self._diffusion_kv_manager = None
+        self._step_batch_model_key_func = get_diffusion_step_batch_key_func(od_config)
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -422,8 +427,14 @@ class BaseScheduler(ABC):
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        model_key = (
+            self._step_batch_model_key_func(request)
+            if self._step_batch_model_key_func is not None
+            else None
+        )
         return StepBatchSamplingParamsKey(
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            model_key=model_key,
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 

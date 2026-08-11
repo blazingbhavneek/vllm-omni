@@ -285,45 +285,61 @@ def resolve_model_config_path(model: str) -> str | None:
     # local copy that vLLM-Omni materializes for such URIs. Name-based
     # fallbacks keep the original string (the materialized path is a hash).
     config_source = _materialize_object_storage_configs(model)
-    # Try to get config from standard transformers format first
-    try:
-        hf_config = get_config(config_source, trust_remote_code=True)
-        model_type = hf_config.model_type
-    except (ValueError, Exception):
-        # If standard transformers format fails, try diffusers format
-        if get_diffusion_model_index(config_source) is not None:
-            model_type = _try_get_class_name_from_diffusers_config(config_source)
-            if model_type is None:
-                raise ValueError(
-                    f"Could not determine model_type for diffusers model: {model}. "
-                    "Please ensure its Diffusers pipeline index contains '_class_name'"
-                )
-        elif file_or_path_exists(config_source, "config.json", revision=None):
-            # Try to read config.json manually for custom models like Bagel that fail get_config
-            # but have a valid config.json with model_type
-            try:
-                config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
-                if config_dict and "model_type" in config_dict:
-                    model_type = config_dict["model_type"]
-                else:
-                    # For models with empty config.json (e.g. CosyVoice3),
-                    # try matching against registered omni stage configs.
-                    model_type = _try_resolve_omni_model_type(model)
-                    if model_type is None:
-                        raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
-            except Exception as e:
-                raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
-        else:
-            # No config.json at repo root (e.g. GLM-TTS stores configs in
-            # subdirectories only).  Try matching against registered deploy
-            # YAML filenames before giving up.
-            model_type = _try_resolve_omni_model_type(model)
-            if model_type is None:
-                raise ValueError(
-                    f"Could not determine model_type for model: {model}. "
-                    "Model is not in standard transformers or Diffusers format. "
-                    f"Please ensure the model has proper configuration files with 'model_type' field"
-                )
+    # A local Diffusers-style pipeline can also contain a config.json whose
+    # ``model_type`` is intentionally unknown to Transformers. Recognize the
+    # pipeline index first so native pipelines (such as Irodori-TTS) do not
+    # emit repeated, misleading Transformers compatibility errors.
+    local_model_path = Path(config_source).expanduser()
+    has_local_pipeline_index = local_model_path.is_dir() and any(
+        (local_model_path / filename).is_file() for filename in ("model_index.json", "modular_model_index.json")
+    )
+    if has_local_pipeline_index:
+        model_type = _try_get_class_name_from_diffusers_config(config_source)
+        if model_type is None:
+            raise ValueError(
+                f"Could not determine model_type for diffusers model: {model}. "
+                "Please ensure its Diffusers pipeline index contains '_class_name'"
+            )
+    else:
+        # Try to get config from standard transformers format first
+        try:
+            hf_config = get_config(config_source, trust_remote_code=True)
+            model_type = hf_config.model_type
+        except (ValueError, Exception):
+            # If standard transformers format fails, try diffusers format
+            if get_diffusion_model_index(config_source) is not None:
+                model_type = _try_get_class_name_from_diffusers_config(config_source)
+                if model_type is None:
+                    raise ValueError(
+                        f"Could not determine model_type for diffusers model: {model}. "
+                        "Please ensure its Diffusers pipeline index contains '_class_name'"
+                    )
+            elif file_or_path_exists(config_source, "config.json", revision=None):
+                # Try to read config.json manually for custom models like Bagel that fail get_config
+                # but have a valid config.json with model_type
+                try:
+                    config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
+                    if config_dict and "model_type" in config_dict:
+                        model_type = config_dict["model_type"]
+                    else:
+                        # For models with empty config.json (e.g. CosyVoice3),
+                        # try matching against registered omni stage configs.
+                        model_type = _try_resolve_omni_model_type(model)
+                        if model_type is None:
+                            raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                except Exception as e:
+                    raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
+            else:
+                # No config.json at repo root (e.g. GLM-TTS stores configs in
+                # subdirectories only).  Try matching against registered deploy
+                # YAML filenames before giving up.
+                model_type = _try_resolve_omni_model_type(model)
+                if model_type is None:
+                    raise ValueError(
+                        f"Could not determine model_type for model: {model}. "
+                        "Model is not in standard transformers or Diffusers format. "
+                        f"Please ensure the model has proper configuration files with 'model_type' field"
+                    )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
     if model_type == "vla" and _looks_like_dreamzero(config_source):

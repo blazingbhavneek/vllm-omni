@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -16,14 +17,27 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import (
+    SupportAudioOutput,
+    SupportsComponentDiscovery,
+)
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import IrodoriCheckpointConfig, read_irodori_checkpoint_config, resolve_irodori_checkpoint
 from .duration import build_duration_features
 from .model import TextToLatentRFDiT
-from .sampler import sample_euler_rf_cfg
+from .sampler import (
+    IrodoriConditionState,
+    IrodoriSamplingState,
+    apply_euler_rf_cfg_step,
+    encode_irodori_conditions,
+    predict_euler_rf_cfg_batch,
+    predict_euler_rf_cfg_step,
+    prepare_euler_rf_cfg,
+)
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 
@@ -41,7 +55,115 @@ def get_irodori_tts_post_process_func(_od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery):
+@dataclass(frozen=True)
+class IrodoriStepBatchKey:
+    """Request properties that must match for an exact-length DiT step batch."""
+
+    seconds: float | None
+    num_steps: int
+    cfg_branches: tuple[str, ...]
+    cfg_scale_text: float
+    cfg_scale_caption: float
+    cfg_scale_speaker: float
+    cfg_min_t: float = 0.5
+    cfg_max_t: float = 1.0
+    cfg_schedule: str = "linear"
+    output_type: str = "np"
+
+
+def get_irodori_tts_step_batch_key_func(od_config: OmniDiffusionConfig):
+    """Build scheduler-owned compatibility keys without loading model weights."""
+
+    def step_batch_key(request: Any) -> IrodoriStepBatchKey:
+        sampling = request.sampling_params
+        extra = dict(getattr(sampling, "extra_args", {}) or {})
+        raw_num_steps = getattr(sampling, "num_inference_steps", None)
+        if raw_num_steps is None:
+            raw_num_steps = extra.get("num_steps", 40)
+        num_steps = IrodoriTTSPipeline._positive_int(
+            raw_num_steps,
+            name="num_steps",
+            minimum=1,
+            maximum=100,
+        )
+        raw_seconds = extra.get("seconds")
+        seconds = (
+            None
+            if raw_seconds is None
+            else IrodoriTTSPipeline._finite_float(
+                raw_seconds,
+                name="seconds",
+                minimum=0.5,
+                maximum=30.0,
+            )
+        )
+        if seconds is None and int(getattr(od_config, "max_num_seqs", 1)) > 1:
+            raise ValueError(
+                "Initial Irodori continuous batching requires explicit `seconds`; "
+                "use max_num_seqs=1 for predicted-duration requests."
+            )
+        cfg_scale_text = IrodoriTTSPipeline._finite_float(
+            extra.get("cfg_scale_text", 3.0),
+            name="cfg_scale_text",
+            minimum=0.0,
+            maximum=10.0,
+        )
+        cfg_scale_caption = IrodoriTTSPipeline._finite_float(
+            extra.get("cfg_scale_caption", 3.0),
+            name="cfg_scale_caption",
+            minimum=0.0,
+            maximum=10.0,
+        )
+        cfg_scale_speaker = IrodoriTTSPipeline._finite_float(
+            extra.get("cfg_scale_speaker", 5.0),
+            name="cfg_scale_speaker",
+            minimum=0.0,
+            maximum=10.0,
+        )
+        prompt = getattr(request, "prompt", None)
+        caption = ""
+        if isinstance(prompt, dict):
+            caption = prompt.get("caption") or prompt.get("instruct") or ""
+        if not isinstance(caption, str):
+            raise ValueError("Irodori caption must be a string when provided.")
+        cfg_branches = tuple(
+            name
+            for name, enabled in (
+                ("text", cfg_scale_text > 0),
+                ("speaker", cfg_scale_speaker > 0),
+                ("caption", cfg_scale_caption > 0 and bool(caption.strip())),
+            )
+            if enabled
+        )
+        output_type = getattr(sampling, "output_type", None) or "np"
+        if output_type not in {"np", "pt", "latent"}:
+            raise ValueError("Irodori output_type must be one of: np, pt, latent.")
+        return IrodoriStepBatchKey(
+            seconds=seconds,
+            num_steps=num_steps,
+            cfg_branches=cfg_branches,
+            cfg_scale_text=cfg_scale_text,
+            cfg_scale_caption=cfg_scale_caption,
+            cfg_scale_speaker=cfg_scale_speaker,
+            output_type=output_type,
+        )
+
+    return step_batch_key
+
+
+@dataclass
+class _IrodoriPreparedRequest:
+    sampling_state: IrodoriSamplingState
+    latent_steps: int
+    target_samples: int
+    output_type: str
+
+
+class IrodoriTTSPipeline(
+    nn.Module,
+    SupportAudioOutput,
+    SupportsComponentDiscovery,
+):
     """Irodori v4-Small with one complete request per diffusion invocation.
 
     All transformer, speaker, duration, and DiT parameters live under
@@ -50,6 +172,7 @@ class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscove
     """
 
     supports_request_batch: ClassVar[bool] = False
+    supports_step_execution: ClassVar[bool] = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 48000
     _dit_modules: ClassVar[list[str]] = ["model"]
@@ -269,12 +392,7 @@ class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscove
         self,
         *,
         text: str,
-        text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
-        caption_ids: torch.Tensor,
-        caption_mask: torch.Tensor,
-        ref_latent: torch.Tensor,
-        ref_mask: torch.Tensor,
+        condition: IrodoriConditionState,
         has_reference: bool,
         options: dict[str, Any],
     ) -> tuple[int, int]:
@@ -282,20 +400,23 @@ class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscove
             target_samples = round(options["seconds"] * self.codec.sample_rate)
             return math.ceil(target_samples / self.codec.hop_length), target_samples
         features = build_duration_features(
-            [text], token_counts=text_mask.sum(dim=1), max_text_len=self.checkpoint_config.max_text_len,
+            [text],
+            token_counts=condition.text_mask.sum(dim=1),
+            max_text_len=self.checkpoint_config.max_text_len,
             has_speaker=[has_reference],
         ).to(self.device)
-        text_state, text_condition_mask, speaker_state, speaker_mask, caption_state, caption_condition_mask = (
-            self.model.encode_conditions(
-                text_input_ids=text_ids, text_mask=text_mask, ref_latent=ref_latent, ref_mask=ref_mask,
-                caption_input_ids=caption_ids, caption_mask=caption_mask,
-            )
-        )
         prediction = self.model.predict_duration_log_frames(
-            text_state=text_state, text_mask=text_condition_mask, speaker_state=speaker_state,
-            speaker_mask=speaker_mask, caption_state=caption_state, caption_mask=caption_condition_mask,
+            text_state=condition.text_state,
+            text_mask=condition.text_mask,
+            speaker_state=condition.speaker_state,
+            speaker_mask=condition.speaker_mask,
+            caption_state=condition.caption_state,
+            caption_mask=condition.caption_mask,
             duration_features=features, has_speaker=torch.tensor([has_reference], device=self.device),
-            has_caption=torch.tensor([bool(caption_condition_mask.any().item())], device=self.device),
+            has_caption=torch.tensor(
+                [condition.caption_mask is not None and bool(condition.caption_mask.any().item())],
+                device=self.device,
+            ),
         )
         latent_steps = round(float(torch.expm1(prediction).mean().item()) * options["duration_scale"])
         minimum = math.ceil(0.5 * self.codec.sample_rate / self.codec.hop_length)
@@ -303,15 +424,12 @@ class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscove
         latent_steps = min(max(latent_steps, minimum), maximum)
         return latent_steps, latent_steps * self.codec.hop_length
 
-    @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        if req.num_reqs != 1:
-            raise ValueError("Irodori-TTS supports one request per diffusion invocation.")
-        text, caption, ref_audio = self._parse_prompt(req.prompts[0])
+    def _prepare_request(self, prompt: Any, sampling: Any) -> _IrodoriPreparedRequest:
+        text, caption, ref_audio = self._parse_prompt(prompt)
         text = normalize_text(text).strip()
         if not text:
             raise ValueError("Irodori input text is empty after normalization.")
-        options = self._sampling_options(req.sampling_params)
+        options = self._sampling_options(sampling)
         if options["output_type"] not in {"np", "pt", "latent"}:
             raise ValueError("Irodori output_type must be one of: np, pt, latent.")
         text_ids, text_mask = self.tokenizer.batch_encode([text], max_length=self.checkpoint_config.max_text_len)
@@ -325,23 +443,140 @@ class IrodoriTTSPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscove
         text_ids, text_mask = text_ids.to(self.device), text_mask.to(self.device)
         caption_ids, caption_mask = caption_ids.to(self.device), caption_mask.to(self.device)
         ref_latent, ref_mask, has_reference = self._prepare_reference(ref_audio)
+        condition = encode_irodori_conditions(
+            self.model,
+            text_ids,
+            text_mask,
+            ref_latent,
+            ref_mask,
+            caption_input_ids=caption_ids,
+            caption_mask=caption_mask,
+        )
         latent_steps, target_samples = self._duration_steps(
-            text=text, text_ids=text_ids, text_mask=text_mask, caption_ids=caption_ids, caption_mask=caption_mask,
-            ref_latent=ref_latent, ref_mask=ref_mask, has_reference=has_reference, options=options,
+            text=text,
+            condition=condition,
+            has_reference=has_reference,
+            options=options,
         )
         patched_steps = math.ceil(latent_steps / self.checkpoint_config.model.latent_patch_size)
-        latent = sample_euler_rf_cfg(
-            self.model, text_ids, text_mask, ref_latent, ref_mask, patched_steps,
-            caption_input_ids=caption_ids, caption_mask=caption_mask, num_steps=options["num_steps"],
-            cfg_scale_text=options["cfg_scale_text"], cfg_scale_caption=options["cfg_scale_caption"],
-            cfg_scale_speaker=options["cfg_scale_speaker"], cfg_guidance_mode="independent", cfg_min_t=0.5,
-            cfg_max_t=1.0, seed=options["seed"], generator=options["generator"], initial_latents=options["latents"],
-            use_context_kv_cache=True, t_schedule_mode="linear",
+        return _IrodoriPreparedRequest(
+            sampling_state=prepare_euler_rf_cfg(
+                self.model,
+                text_ids,
+                text_mask,
+                ref_latent,
+                ref_mask,
+                patched_steps,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                num_steps=options["num_steps"],
+                cfg_scale_text=options["cfg_scale_text"],
+                cfg_scale_caption=options["cfg_scale_caption"],
+                cfg_scale_speaker=options["cfg_scale_speaker"],
+                cfg_guidance_mode="independent",
+                cfg_min_t=0.5,
+                cfg_max_t=1.0,
+                seed=options["seed"],
+                generator=options["generator"],
+                initial_latents=options["latents"],
+                use_context_kv_cache=True,
+                t_schedule_mode="linear",
+                condition_state=condition,
+            ),
+            latent_steps=latent_steps,
+            target_samples=target_samples,
+            output_type=options["output_type"],
         )
+
+    def _decode_prepared_request(
+        self,
+        prepared: _IrodoriPreparedRequest,
+        *,
+        output_type: str | None = None,
+    ) -> DiffusionOutput:
         latent = unpatchify_latent(
-            latent, self.checkpoint_config.model.latent_patch_size, self.checkpoint_config.model.latent_dim
-        )[:, :latent_steps]
-        if options["output_type"] == "latent":
+            prepared.sampling_state.latents,
+            self.checkpoint_config.model.latent_patch_size,
+            self.checkpoint_config.model.latent_dim,
+        )[:, : prepared.latent_steps]
+        if (output_type or prepared.output_type) == "latent":
             return DiffusionOutput(output=latent)
-        waveform = self.codec.decode_latent(latent)[:, :, :target_samples]
+        waveform = self.codec.decode_latent(latent)[:, :, : prepared.target_samples]
         return DiffusionOutput(output=waveform)
+
+    @torch.inference_mode()
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if req.num_reqs != 1:
+            raise ValueError("Irodori-TTS supports one request per diffusion invocation.")
+        prepared = self._prepare_request(req.prompts[0], req.sampling_params)
+        while prepared.sampling_state.step_index < prepared.sampling_state.total_steps:
+            prediction = predict_euler_rf_cfg_step(self.model, prepared.sampling_state)
+            apply_euler_rf_cfg_step(prepared.sampling_state, prediction)
+        return self._decode_prepared_request(prepared)
+
+    def prepare_encode(self, state: StepRequestState, **_: Any) -> StepRequestState:
+        """Prepare one request's conditions, noise, schedule, and static K/V."""
+        prepared = self._prepare_request(state.prompt, state.sampling)
+        state.latents = prepared.sampling_state.latents
+        state.timesteps = prepared.sampling_state.t_schedule[:-1]
+        state.step_index = 0
+        state.extra["irodori"] = prepared
+        return state
+
+    @staticmethod
+    def _step_batch_group_key(sampling_state: IrodoriSamplingState) -> tuple[Any, ...]:
+        cfg_active = sampling_state.cfg_active[sampling_state.step_index]
+        return (
+            tuple(sampling_state.latents.shape[1:]),
+            sampling_state.latents.dtype,
+            sampling_state.latents.device,
+            sampling_state.cfg_guidance_mode,
+            sampling_state.independent_names if cfg_active else ("cond",),
+        )
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: list[StepRequestState] | None = None,
+        **_: Any,
+    ) -> torch.Tensor | None:
+        """Run one fused DiT call per compatible active Irodori subgroup."""
+        active_states = states or list(input_batch.states)
+        grouped: dict[tuple[Any, ...], list[tuple[StepRequestState, _IrodoriPreparedRequest]]] = {}
+        for state in active_states:
+            prepared = state.extra.get("irodori")
+            if not isinstance(prepared, _IrodoriPreparedRequest):
+                raise ValueError(f"Missing Irodori step state for request {state.request_id}.")
+            if state.step_index != prepared.sampling_state.step_index:
+                raise ValueError(f"Irodori step index diverged for request {state.request_id}.")
+            grouped.setdefault(self._step_batch_group_key(prepared.sampling_state), []).append((state, prepared))
+
+        predictions: dict[str, torch.Tensor] = {}
+        for group in grouped.values():
+            sampling_states = [prepared.sampling_state for _, prepared in group]
+            for state, prediction in zip(
+                (state for state, _ in group),
+                predict_euler_rf_cfg_batch(self.model, sampling_states),
+                strict=True,
+            ):
+                predictions[state.request_id] = prediction
+        return torch.cat([predictions[state.request_id] for state in active_states], dim=0)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **_: Any) -> None:
+        """Apply one exact Euler update to one request-local latent."""
+        prepared = state.extra.get("irodori")
+        if not isinstance(prepared, _IrodoriPreparedRequest):
+            raise ValueError(f"Missing Irodori step state for request {state.request_id}.")
+        if state.step_index != prepared.sampling_state.step_index:
+            raise ValueError(f"Irodori step index diverged for request {state.request_id}.")
+        apply_euler_rf_cfg_step(prepared.sampling_state, noise_pred)
+        state.latents = prepared.sampling_state.latents
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Return the final latent or waveform for a completed Irodori request."""
+        prepared = state.extra.get("irodori")
+        if not isinstance(prepared, _IrodoriPreparedRequest):
+            raise ValueError(f"Missing Irodori step state for request {state.request_id}.")
+        return self._decode_prepared_request(prepared, output_type=kwargs.get("output_type"))

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -118,8 +119,145 @@ def scale_speaker_kv_cache(
         v_speaker.mul_(scale)
 
 
+ConditionBundle = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]
+ContextKVCache = list[tuple[torch.Tensor, ...]]
+
+
+@dataclass(frozen=True)
+class IrodoriConditionState:
+    """Encoded request conditions shared by duration prediction and sampling."""
+
+    text_state: torch.Tensor
+    text_mask: torch.Tensor
+    speaker_state: torch.Tensor | None
+    speaker_mask: torch.Tensor | None
+    caption_state: torch.Tensor | None
+    caption_mask: torch.Tensor | None
+
+
+@dataclass
+class IrodoriSamplingState:
+    """Mutable request-local state for rectified-flow Euler sampling."""
+
+    latents: torch.Tensor
+    t_schedule: torch.Tensor
+    cfg_active: tuple[bool, ...]
+    condition: IrodoriConditionState
+    cond_bundle: ConditionBundle
+    independent_bundle: ConditionBundle
+    independent_names: tuple[str, ...]
+    cfg_scales: dict[str, float]
+    cfg_guidance_mode: str
+    enabled_cfg_names: tuple[str, ...]
+    joint_uncond_bundle: ConditionBundle
+    alternating_bundles: dict[str, ConditionBundle]
+    context_kv_cond: ContextKVCache | None
+    context_kv_cfg: ContextKVCache | None
+    context_kv_joint_uncond: ContextKVCache | None
+    context_kv_alternating: dict[str, ContextKVCache]
+    rescale_k: float | None
+    rescale_sigma: float | None
+    speaker_kv_scale: float | None
+    speaker_kv_max_layers: int | None
+    speaker_kv_min_t: float | None
+    speaker_kv_active: bool
+    latent_mask: torch.Tensor | None = None
+    step_index: int = 0
+
+    @property
+    def total_steps(self) -> int:
+        return int(self.t_schedule.shape[0] - 1)
+
+    @property
+    def current_timestep(self) -> torch.Tensor:
+        if self.step_index >= self.total_steps:
+            raise ValueError("Sampling has already completed.")
+        return self.t_schedule[self.step_index]
+
+    @property
+    def cfg_rows(self) -> int:
+        return len(self.independent_names)
+
+
+def encode_irodori_conditions(
+    model: TextToLatentRFDiT,
+    text_input_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    ref_latent: torch.Tensor | None,
+    ref_mask: torch.Tensor | None,
+    *,
+    caption_input_ids: torch.Tensor | None = None,
+    caption_mask: torch.Tensor | None = None,
+    speaker_state_override: torch.Tensor | None = None,
+    speaker_mask_override: torch.Tensor | None = None,
+    speaker_uncond_mode: str = "mask",
+) -> IrodoriConditionState:
+    """Encode text, speaker, and caption conditions once for one request."""
+    (
+        text_state,
+        condition_text_mask,
+        speaker_state,
+        speaker_mask,
+        caption_state,
+        condition_caption_mask,
+    ) = model.encode_conditions(
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        ref_latent=ref_latent,
+        ref_mask=ref_mask,
+        caption_input_ids=caption_input_ids,
+        caption_mask=caption_mask,
+        speaker_state_override=speaker_state_override,
+        speaker_mask_override=speaker_mask_override,
+        speaker_uncond_mode=speaker_uncond_mode,
+    )
+    return IrodoriConditionState(
+        text_state=text_state,
+        text_mask=condition_text_mask,
+        speaker_state=speaker_state,
+        speaker_mask=speaker_mask,
+        caption_state=caption_state,
+        caption_mask=condition_caption_mask,
+    )
+
+
+def _bundle(
+    *,
+    text_state: torch.Tensor,
+    text_mask: torch.Tensor,
+    speaker_state: torch.Tensor | None,
+    speaker_mask: torch.Tensor | None,
+    caption_state: torch.Tensor | None,
+    caption_mask: torch.Tensor | None,
+) -> ConditionBundle:
+    return (
+        text_state,
+        text_mask,
+        speaker_state,
+        speaker_mask,
+        caption_state,
+        caption_mask,
+    )
+
+
+def _cat_optional_tensors(values: list[torch.Tensor | None]) -> torch.Tensor | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    if len(present) != len(values):
+        raise ValueError("Cannot concatenate optional condition tensors with mixed presence.")
+    return torch.cat(present, dim=0)
+
+
 @torch.inference_mode()
-def sample_euler_rf_cfg(
+def prepare_euler_rf_cfg(
     model: TextToLatentRFDiT,
     text_input_ids: torch.Tensor,
     text_mask: torch.Tensor,
@@ -151,13 +289,10 @@ def sample_euler_rf_cfg(
     sway_coeff: float = -1.0,
     generator: torch.Generator | None = None,
     initial_latents: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Euler sampling over RF ODE with text/reference/caption conditioning CFG.
-
-    Returns:
-      latent sequence in patched space, shape (B, sequence_length, patched_latent_dim)
-    """
+    condition_state: IrodoriConditionState | None = None,
+    latent_mask: torch.Tensor | None = None,
+) -> IrodoriSamplingState:
+    """Prepare request-local state without running a DiT denoise step."""
     device = model.device
     dtype = model.dtype
     batch_size = text_input_ids.shape[0]
@@ -254,24 +389,24 @@ def sample_euler_rf_cfg(
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
 
-    (
-        text_state_cond,
-        text_mask_cond,
-        speaker_state_cond,
-        speaker_mask_cond,
-        caption_state_cond,
-        caption_mask_cond,
-    ) = model.encode_conditions(
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
+    condition = condition_state or encode_irodori_conditions(
+        model,
+        text_input_ids,
+        text_mask,
+        ref_latent,
+        ref_mask,
         caption_input_ids=caption_input_ids,
         caption_mask=caption_mask,
         speaker_state_override=speaker_state_override,
         speaker_mask_override=speaker_mask_override,
         speaker_uncond_mode=speaker_uncond_mode,
     )
+    text_state_cond = condition.text_state
+    text_mask_cond = condition.text_mask
+    speaker_state_cond = condition.speaker_state
+    speaker_mask_cond = condition.speaker_mask
+    caption_state_cond = condition.caption_state
+    caption_mask_cond = condition.caption_mask
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None
@@ -314,38 +449,13 @@ def sample_euler_rf_cfg(
     )
     has_speaker_cfg = cfg_scale_speaker > 0
 
-    def _bundle(
-        *,
-        text_state: torch.Tensor,
-        text_mask_val: torch.Tensor,
-        speaker_state: torch.Tensor | None,
-        speaker_mask_val: torch.Tensor | None,
-        caption_state: torch.Tensor | None,
-        caption_mask_val: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        return (
-            text_state,
-            text_mask_val,
-            speaker_state,
-            speaker_mask_val,
-            caption_state,
-            caption_mask_val,
-        )
-
     cond_bundle = _bundle(
         text_state=text_state_cond,
-        text_mask_val=text_mask_cond,
+        text_mask=text_mask_cond,
         speaker_state=speaker_state_cond,
-        speaker_mask_val=speaker_mask_cond,
+        speaker_mask=speaker_mask_cond,
         caption_state=caption_state_cond,
-        caption_mask_val=caption_mask_cond,
+        caption_mask=caption_mask_cond,
     )
     enabled_cfg_names: list[str] = []
     cfg_scales: dict[str, float] = {}
@@ -367,30 +477,22 @@ def sample_euler_rf_cfg(
             independent_bundles.append(
                 _bundle(
                     text_state=text_state_uncond if name == "text" else text_state_cond,
-                    text_mask_val=text_mask_uncond if name == "text" else text_mask_cond,
+                    text_mask=text_mask_uncond if name == "text" else text_mask_cond,
                     speaker_state=(
                         speaker_state_uncond if name == "speaker" else speaker_state_cond
                     ),
-                    speaker_mask_val=(
+                    speaker_mask=(
                         speaker_mask_uncond if name == "speaker" else speaker_mask_cond
                     ),
                     caption_state=(
                         caption_state_uncond if name == "caption" else caption_state_cond
                     ),
-                    caption_mask_val=(
+                    caption_mask=(
                         caption_mask_uncond if name == "caption" else caption_mask_cond
                     ),
                 )
             )
     cfg_batch_mult = len(independent_bundles)
-
-    def _cat_optional_tensors(values: list[torch.Tensor | None]) -> torch.Tensor | None:
-        present = [value for value in values if value is not None]
-        if not present:
-            return None
-        if len(present) != len(values):
-            raise ValueError("Cannot concatenate optional condition tensors with mixed presence.")
-        return torch.cat(present, dim=0)
 
     independent_text_state = torch.cat([bundle[0] for bundle in independent_bundles], dim=0)
     independent_text_mask = torch.cat([bundle[1] for bundle in independent_bundles], dim=0)
@@ -401,11 +503,11 @@ def sample_euler_rf_cfg(
 
     joint_uncond_bundle = _bundle(
         text_state=text_state_uncond,
-        text_mask_val=text_mask_uncond,
+        text_mask=text_mask_uncond,
         speaker_state=speaker_state_uncond,
-        speaker_mask_val=speaker_mask_uncond,
+        speaker_mask=speaker_mask_uncond,
         caption_state=caption_state_uncond,
-        caption_mask_val=caption_mask_uncond,
+        caption_mask=caption_mask_uncond,
     )
 
     alternating_bundles: dict[
@@ -421,29 +523,29 @@ def sample_euler_rf_cfg(
     ] = {
         "text": _bundle(
             text_state=text_state_uncond,
-            text_mask_val=text_mask_uncond,
+            text_mask=text_mask_uncond,
             speaker_state=speaker_state_cond,
-            speaker_mask_val=speaker_mask_cond,
+            speaker_mask=speaker_mask_cond,
             caption_state=caption_state_cond,
-            caption_mask_val=caption_mask_cond,
+            caption_mask=caption_mask_cond,
         ),
         "caption": _bundle(
             text_state=text_state_cond,
-            text_mask_val=text_mask_cond,
+            text_mask=text_mask_cond,
             speaker_state=speaker_state_cond,
-            speaker_mask_val=speaker_mask_cond,
+            speaker_mask=speaker_mask_cond,
             caption_state=caption_state_uncond,
-            caption_mask_val=caption_mask_uncond,
+            caption_mask=caption_mask_uncond,
         ),
     }
     if has_speaker_cfg:
         alternating_bundles["speaker"] = _bundle(
             text_state=text_state_cond,
-            text_mask_val=text_mask_cond,
+            text_mask=text_mask_cond,
             speaker_state=speaker_state_uncond,
-            speaker_mask_val=speaker_mask_uncond,
+            speaker_mask=speaker_mask_uncond,
             caption_state=caption_state_cond,
-            caption_mask_val=caption_mask_cond,
+            caption_mask=caption_mask_cond,
         )
 
     # Force-speaker scaling operates on projected speaker K/V, so it requires context KV caches.
@@ -498,131 +600,405 @@ def sample_euler_rf_cfg(
                 scale=float(speaker_kv_scale),
                 max_layers=speaker_kv_max_layers,
             )
-    speaker_kv_active = speaker_kv_scale is not None
+    cfg_active_values = t_schedule[:-1].detach().float().cpu().tolist()
+    return IrodoriSamplingState(
+        latents=x_t,
+        t_schedule=t_schedule,
+        cfg_active=tuple(
+            bool(enabled_cfg_names) and cfg_min_t <= float(t) <= cfg_max_t
+            for t in cfg_active_values
+        ),
+        condition=condition,
+        cond_bundle=cond_bundle,
+        independent_bundle=(
+            independent_text_state,
+            independent_text_mask,
+            independent_speaker_state,
+            independent_speaker_mask,
+            independent_caption_state,
+            independent_caption_mask,
+        ),
+        independent_names=tuple(independent_names),
+        cfg_scales=cfg_scales,
+        cfg_guidance_mode=cfg_guidance_mode,
+        enabled_cfg_names=tuple(enabled_cfg_names),
+        joint_uncond_bundle=joint_uncond_bundle,
+        alternating_bundles=alternating_bundles,
+        context_kv_cond=context_kv_cond,
+        context_kv_cfg=context_kv_cfg,
+        context_kv_joint_uncond=context_kv_joint_uncond,
+        context_kv_alternating=context_kv_alternating,
+        rescale_k=rescale_k,
+        rescale_sigma=rescale_sigma,
+        speaker_kv_scale=speaker_kv_scale,
+        speaker_kv_max_layers=speaker_kv_max_layers,
+        speaker_kv_min_t=speaker_kv_min_t,
+        speaker_kv_active=speaker_kv_scale is not None,
+        latent_mask=latent_mask,
+    )
 
-    for i in range(num_steps):
-        t = t_schedule[i]
-        t_next = t_schedule[i + 1]
-        tt = torch.full((batch_size,), t, device=device, dtype=dtype)
 
-        use_cfg = bool(enabled_cfg_names) and (cfg_min_t <= t.item() <= cfg_max_t)
-        if use_cfg:
-            if use_independent_cfg:
-                x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
-                tt_cfg = tt.repeat(cfg_batch_mult)
-                v_out = model.forward_with_encoded_conditions(
-                    x_t=x_t_cfg,
-                    t=tt_cfg,
-                    text_state=independent_text_state,
-                    text_mask=independent_text_mask,
-                    speaker_state=independent_speaker_state,
-                    speaker_mask=independent_speaker_mask,
-                    caption_state=independent_caption_state,
-                    caption_mask=independent_caption_mask,
-                    context_kv_cache=context_kv_cfg,
-                )
-                chunks = v_out.chunk(cfg_batch_mult, dim=0)
-                v = chunks[0]
-                for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
-                    v = v + cfg_scales[name] * (chunks[0] - chunk)
-            else:
-                v_cond = model.forward_with_encoded_conditions(
-                    x_t=x_t.to(dtype),
-                    t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    caption_state=caption_state_cond,
-                    caption_mask=caption_mask_cond,
-                    context_kv_cache=context_kv_cond,
-                )
-                if use_joint_cfg:
-                    if len(enabled_cfg_names) > 1:
-                        joint_scales = [cfg_scales[name] for name in enabled_cfg_names]
-                        if max(joint_scales) - min(joint_scales) > 1e-6:
-                            raise ValueError(
-                                "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
-                                "set matching text/speaker/caption scales or use --cfg-scale."
-                            )
-                    joint_scale = cfg_scales[enabled_cfg_names[0]]
-                    v_uncond_joint = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=joint_uncond_bundle[0],
-                        text_mask=joint_uncond_bundle[1],
-                        speaker_state=joint_uncond_bundle[2],
-                        speaker_mask=joint_uncond_bundle[3],
-                        caption_state=joint_uncond_bundle[4],
-                        caption_mask=joint_uncond_bundle[5],
-                        context_kv_cache=context_kv_joint_uncond,
+def _forward_with_bundle(
+    model: TextToLatentRFDiT,
+    *,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    bundle: ConditionBundle,
+    latent_mask: torch.Tensor | None,
+    context_kv_cache: ContextKVCache | None,
+) -> torch.Tensor:
+    return model.forward_with_encoded_conditions(
+        x_t=x_t,
+        t=t,
+        text_state=bundle[0],
+        text_mask=bundle[1],
+        speaker_state=bundle[2],
+        speaker_mask=bundle[3],
+        caption_state=bundle[4],
+        caption_mask=bundle[5],
+        latent_mask=latent_mask,
+        context_kv_cache=context_kv_cache,
+    )
+
+
+@torch.inference_mode()
+def predict_euler_rf_cfg_step(
+    model: TextToLatentRFDiT,
+    state: IrodoriSamplingState,
+) -> torch.Tensor:
+    """Return one request's velocity prediction without mutating its latent."""
+    t = state.current_timestep
+    batch_size = state.latents.shape[0]
+    tt = torch.full((batch_size,), t, device=model.device, dtype=model.dtype)
+
+    if state.cfg_active[state.step_index]:
+        if state.cfg_guidance_mode == "independent":
+            cfg_rows = state.cfg_rows
+            prediction = _forward_with_bundle(
+                model,
+                x_t=torch.cat([state.latents] * cfg_rows, dim=0).to(model.dtype),
+                t=tt.repeat(cfg_rows),
+                bundle=state.independent_bundle,
+                latent_mask=(
+                    None
+                    if state.latent_mask is None
+                    else torch.cat([state.latent_mask] * cfg_rows, dim=0)
+                ),
+                context_kv_cache=state.context_kv_cfg,
+            )
+            chunks = prediction.chunk(cfg_rows, dim=0)
+            velocity = chunks[0]
+            for name, chunk in zip(state.independent_names[1:], chunks[1:], strict=True):
+                velocity = velocity + state.cfg_scales[name] * (chunks[0] - chunk)
+            return velocity
+
+        velocity_cond = _forward_with_bundle(
+            model,
+            x_t=state.latents.to(model.dtype),
+            t=tt,
+            bundle=state.cond_bundle,
+            latent_mask=state.latent_mask,
+            context_kv_cache=state.context_kv_cond,
+        )
+        if state.cfg_guidance_mode == "joint":
+            if len(state.enabled_cfg_names) > 1:
+                joint_scales = [state.cfg_scales[name] for name in state.enabled_cfg_names]
+                if max(joint_scales) - min(joint_scales) > 1e-6:
+                    raise ValueError(
+                        "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
+                        "set matching text/speaker/caption scales or use --cfg-scale."
                     )
-                    v = v_cond + joint_scale * (v_cond - v_uncond_joint)
-                elif use_alternating_cfg:
-                    alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
-                    alt_bundle = alternating_bundles[alt_name]
-                    v_uncond_alt = model.forward_with_encoded_conditions(
-                        x_t=x_t.to(dtype),
-                        t=tt,
-                        text_state=alt_bundle[0],
-                        text_mask=alt_bundle[1],
-                        speaker_state=alt_bundle[2],
-                        speaker_mask=alt_bundle[3],
-                        caption_state=alt_bundle[4],
-                        caption_mask=alt_bundle[5],
-                        context_kv_cache=context_kv_alternating.get(alt_name),
-                    )
-                    v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
-                else:
-                    raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
-        else:
-            v = model.forward_with_encoded_conditions(
-                x_t=x_t.to(dtype),
+            joint_scale = state.cfg_scales[state.enabled_cfg_names[0]]
+            velocity_uncond = _forward_with_bundle(
+                model,
+                x_t=state.latents.to(model.dtype),
                 t=tt,
-                text_state=text_state_cond,
-                text_mask=text_mask_cond,
-                speaker_state=speaker_state_cond,
-                speaker_mask=speaker_mask_cond,
-                caption_state=caption_state_cond,
-                caption_mask=caption_mask_cond,
-                context_kv_cache=context_kv_cond,
+                bundle=state.joint_uncond_bundle,
+                latent_mask=state.latent_mask,
+                context_kv_cache=state.context_kv_joint_uncond,
             )
-
-        if rescale_k is not None and rescale_sigma is not None:
-            v = temporal_score_rescale(
-                v_pred=v,
-                x_t=x_t,
-                t=t,
-                rescale_k=float(rescale_k),
-                rescale_sigma=float(rescale_sigma),
+            return velocity_cond + joint_scale * (velocity_cond - velocity_uncond)
+        if state.cfg_guidance_mode == "alternating":
+            name = state.enabled_cfg_names[state.step_index % len(state.enabled_cfg_names)]
+            velocity_uncond = _forward_with_bundle(
+                model,
+                x_t=state.latents.to(model.dtype),
+                t=tt,
+                bundle=state.alternating_bundles[name],
+                latent_mask=state.latent_mask,
+                context_kv_cache=state.context_kv_alternating.get(name),
             )
+            return velocity_cond + state.cfg_scales[name] * (velocity_cond - velocity_uncond)
+        raise RuntimeError(f"Unexpected cfg_guidance_mode: {state.cfg_guidance_mode}")
 
-        if (
-            speaker_kv_active
-            and speaker_kv_min_t is not None
-            and (t_next < speaker_kv_min_t)
-            and (t >= speaker_kv_min_t)
-        ):
-            inv_scale = 1.0 / float(speaker_kv_scale)
+    return _forward_with_bundle(
+        model,
+        x_t=state.latents.to(model.dtype),
+        t=tt,
+        bundle=state.cond_bundle,
+        latent_mask=state.latent_mask,
+        context_kv_cache=state.context_kv_cond,
+    )
+
+
+def _pad_and_cat(values: list[torch.Tensor], *, dim: int = 1) -> torch.Tensor:
+    if not values:
+        raise ValueError("Cannot concatenate an empty tensor list.")
+    if any(value.ndim != values[0].ndim for value in values):
+        raise ValueError("Batched tensors must have matching ranks.")
+    max_size = max(value.shape[dim] for value in values)
+    padded: list[torch.Tensor] = []
+    for value in values:
+        if value.shape[dim] == max_size:
+            padded.append(value)
+            continue
+        shape = list(value.shape)
+        shape[dim] = max_size - value.shape[dim]
+        padded.append(torch.cat((value, value.new_zeros(shape)), dim=dim))
+    return torch.cat(padded, dim=0)
+
+
+def _pad_and_cat_optional(values: list[torch.Tensor | None], *, dim: int = 1) -> torch.Tensor | None:
+    if not any(value is not None for value in values):
+        return None
+    if not all(value is not None for value in values):
+        raise ValueError("Cannot batch requests with mixed optional condition tensors.")
+    return _pad_and_cat([value for value in values if value is not None], dim=dim)
+
+
+def _collate_bundles(bundles: list[ConditionBundle]) -> ConditionBundle:
+    return (
+        _pad_and_cat([bundle[0] for bundle in bundles]),
+        _pad_and_cat([bundle[1] for bundle in bundles]),
+        _pad_and_cat_optional([bundle[2] for bundle in bundles]),
+        _pad_and_cat_optional([bundle[3] for bundle in bundles]),
+        _pad_and_cat_optional([bundle[4] for bundle in bundles]),
+        _pad_and_cat_optional([bundle[5] for bundle in bundles]),
+    )
+
+
+def _collate_context_kv_caches(caches: list[ContextKVCache | None]) -> ContextKVCache | None:
+    if not any(cache is not None for cache in caches):
+        return None
+    if not all(cache is not None for cache in caches):
+        raise ValueError("Cannot batch requests with mixed context K/V cache modes.")
+    present = [cache for cache in caches if cache is not None]
+    first = present[0]
+    if any(len(cache) != len(first) for cache in present[1:]):
+        raise ValueError("Context K/V cache layer counts must match within a batch.")
+    result: ContextKVCache = []
+    for layer_idx, first_layer in enumerate(first):
+        if any(len(cache[layer_idx]) != len(first_layer) for cache in present[1:]):
+            raise ValueError("Context K/V cache layouts must match within a batch.")
+        result.append(
+            tuple(
+                _pad_and_cat([cache[layer_idx][value_idx] for cache in present])
+                for value_idx in range(len(first_layer))
+            )
+        )
+    return result
+
+
+@torch.inference_mode()
+def predict_euler_rf_cfg_batch(
+    model: TextToLatentRFDiT,
+    states: list[IrodoriSamplingState],
+) -> list[torch.Tensor]:
+    """Run one fused independent-CFG denoise step for compatible requests."""
+    if not states:
+        return []
+    if len(states) == 1:
+        return [predict_euler_rf_cfg_step(model, states[0])]
+    if any(state.cfg_guidance_mode != "independent" for state in states):
+        raise ValueError("Batched Irodori step execution currently requires independent CFG.")
+    if any(state.latents.shape[1:] != states[0].latents.shape[1:] for state in states[1:]):
+        raise ValueError("Batched Irodori denoise requests must have matching latent shapes.")
+    if any(state.latents.dtype != states[0].latents.dtype for state in states[1:]):
+        raise ValueError("Batched Irodori denoise requests must have matching latent dtypes.")
+
+    cfg_active = states[0].cfg_active[states[0].step_index]
+    if any(state.cfg_active[state.step_index] != cfg_active for state in states[1:]):
+        raise ValueError("Batched Irodori requests must have matching active CFG layouts.")
+    if cfg_active and any(state.independent_names != states[0].independent_names for state in states[1:]):
+        raise ValueError("Batched Irodori requests must have matching CFG branches.")
+
+    if cfg_active:
+        cfg_rows = states[0].cfg_rows
+        latents = torch.cat(
+            [torch.cat([state.latents] * cfg_rows, dim=0) for state in states], dim=0
+        ).to(model.dtype)
+        timesteps = torch.cat(
+            [
+                state.current_timestep.reshape(1).expand(state.latents.shape[0] * cfg_rows)
+                for state in states
+            ]
+        ).to(device=model.device, dtype=model.dtype)
+        latent_mask = _pad_and_cat_optional(
+            [
+                None if state.latent_mask is None else torch.cat([state.latent_mask] * cfg_rows, dim=0)
+                for state in states
+            ]
+        )
+        prediction = _forward_with_bundle(
+            model,
+            x_t=latents,
+            t=timesteps,
+            bundle=_collate_bundles([state.independent_bundle for state in states]),
+            latent_mask=latent_mask,
+            context_kv_cache=_collate_context_kv_caches([state.context_kv_cfg for state in states]),
+        )
+        result: list[torch.Tensor] = []
+        offset = 0
+        for state in states:
+            row_count = state.latents.shape[0] * cfg_rows
+            chunks = prediction[offset : offset + row_count].chunk(cfg_rows, dim=0)
+            velocity = chunks[0]
+            for name, chunk in zip(state.independent_names[1:], chunks[1:], strict=True):
+                velocity = velocity + state.cfg_scales[name] * (chunks[0] - chunk)
+            result.append(velocity)
+            offset += row_count
+        return result
+
+    latents = torch.cat([state.latents for state in states], dim=0).to(model.dtype)
+    timesteps = torch.cat(
+        [state.current_timestep.reshape(1).expand(state.latents.shape[0]) for state in states]
+    ).to(device=model.device, dtype=model.dtype)
+    prediction = _forward_with_bundle(
+        model,
+        x_t=latents,
+        t=timesteps,
+        bundle=_collate_bundles([state.cond_bundle for state in states]),
+        latent_mask=_pad_and_cat_optional([state.latent_mask for state in states]),
+        context_kv_cache=_collate_context_kv_caches([state.context_kv_cond for state in states]),
+    )
+    result = []
+    offset = 0
+    for state in states:
+        row_count = state.latents.shape[0]
+        result.append(prediction[offset : offset + row_count])
+        offset += row_count
+    return result
+
+
+@torch.inference_mode()
+def apply_euler_rf_cfg_step(
+    state: IrodoriSamplingState,
+    prediction: torch.Tensor,
+) -> None:
+    """Apply one Euler update and advance a request-local sampling state."""
+    t = state.current_timestep
+    t_next = state.t_schedule[state.step_index + 1]
+    velocity = prediction
+    if state.rescale_k is not None and state.rescale_sigma is not None:
+        velocity = temporal_score_rescale(
+            v_pred=velocity,
+            x_t=state.latents,
+            t=t,
+            rescale_k=float(state.rescale_k),
+            rescale_sigma=float(state.rescale_sigma),
+        )
+    if (
+        state.speaker_kv_active
+        and state.speaker_kv_min_t is not None
+        and (t_next < state.speaker_kv_min_t)
+        and (t >= state.speaker_kv_min_t)
+    ):
+        assert state.speaker_kv_scale is not None
+        inv_scale = 1.0 / float(state.speaker_kv_scale)
+        scale_speaker_kv_cache(
+            context_kv_cache=state.context_kv_cond,
+            scale=inv_scale,
+            max_layers=state.speaker_kv_max_layers,
+        )
+        if state.context_kv_cfg is not None:
             scale_speaker_kv_cache(
-                context_kv_cache=context_kv_cond,
+                context_kv_cache=state.context_kv_cfg,
                 scale=inv_scale,
-                max_layers=speaker_kv_max_layers,
+                max_layers=state.speaker_kv_max_layers,
             )
-            if context_kv_cfg is not None:
-                scale_speaker_kv_cache(
-                    context_kv_cache=context_kv_cfg,
-                    scale=inv_scale,
-                    max_layers=speaker_kv_max_layers,
-                )
-            for cache in context_kv_alternating.values():
-                scale_speaker_kv_cache(
-                    context_kv_cache=cache,
-                    scale=inv_scale,
-                    max_layers=speaker_kv_max_layers,
-                )
-            speaker_kv_active = False
+        for cache in state.context_kv_alternating.values():
+            scale_speaker_kv_cache(
+                context_kv_cache=cache,
+                scale=inv_scale,
+                max_layers=state.speaker_kv_max_layers,
+            )
+        state.speaker_kv_active = False
+    state.latents = state.latents + velocity * (t_next - t)
+    state.step_index += 1
 
-        x_t = x_t + v * (t_next - t)
 
-    return x_t
+@torch.inference_mode()
+def sample_euler_rf_cfg(
+    model: TextToLatentRFDiT,
+    text_input_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    ref_latent: torch.Tensor | None,
+    ref_mask: torch.Tensor | None,
+    sequence_length: int,
+    caption_input_ids: torch.Tensor | None = None,
+    caption_mask: torch.Tensor | None = None,
+    speaker_state_override: torch.Tensor | None = None,
+    speaker_mask_override: torch.Tensor | None = None,
+    speaker_uncond_mode: str = "mask",
+    num_steps: int = 40,
+    cfg_scale_text: float = 3.0,
+    cfg_scale_caption: float = 3.0,
+    cfg_scale_speaker: float = 5.0,
+    cfg_guidance_mode: str = "independent",
+    cfg_min_t: float = 0.5,
+    cfg_max_t: float = 1.0,
+    seed: int = 0,
+    cfg_scale: float | None = None,
+    truncation_factor: float | None = None,
+    rescale_k: float | None = None,
+    rescale_sigma: float | None = None,
+    use_context_kv_cache: bool = True,
+    speaker_kv_scale: float | None = None,
+    speaker_kv_max_layers: int | None = None,
+    speaker_kv_min_t: float | None = None,
+    t_schedule_mode: str = "linear",
+    sway_coeff: float = -1.0,
+    generator: torch.Generator | None = None,
+    initial_latents: torch.Tensor | None = None,
+    condition_state: IrodoriConditionState | None = None,
+    latent_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the legacy complete Euler loop through the reusable step helpers."""
+    state = prepare_euler_rf_cfg(
+        model,
+        text_input_ids,
+        text_mask,
+        ref_latent,
+        ref_mask,
+        sequence_length,
+        caption_input_ids=caption_input_ids,
+        caption_mask=caption_mask,
+        speaker_state_override=speaker_state_override,
+        speaker_mask_override=speaker_mask_override,
+        speaker_uncond_mode=speaker_uncond_mode,
+        num_steps=num_steps,
+        cfg_scale_text=cfg_scale_text,
+        cfg_scale_caption=cfg_scale_caption,
+        cfg_scale_speaker=cfg_scale_speaker,
+        cfg_guidance_mode=cfg_guidance_mode,
+        cfg_min_t=cfg_min_t,
+        cfg_max_t=cfg_max_t,
+        seed=seed,
+        cfg_scale=cfg_scale,
+        truncation_factor=truncation_factor,
+        rescale_k=rescale_k,
+        rescale_sigma=rescale_sigma,
+        use_context_kv_cache=use_context_kv_cache,
+        speaker_kv_scale=speaker_kv_scale,
+        speaker_kv_max_layers=speaker_kv_max_layers,
+        speaker_kv_min_t=speaker_kv_min_t,
+        t_schedule_mode=t_schedule_mode,
+        sway_coeff=sway_coeff,
+        generator=generator,
+        initial_latents=initial_latents,
+        condition_state=condition_state,
+        latent_mask=latent_mask,
+    )
+    while state.step_index < state.total_steps:
+        apply_euler_rf_cfg_step(state, predict_euler_rf_cfg_step(model, state))
+    return state.latents
