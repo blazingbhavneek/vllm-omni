@@ -24,15 +24,24 @@ def main() -> None:
     parser.add_argument("--ref-audio", action="append", default=[])
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--num-steps", type=int, default=40)
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Optional exact duration. Omit it to use the model's predicted duration.",
+    )
     parser.add_argument("--output", default="irodori.wav")
     args = parser.parse_args()
+    extra_params = {"num_steps": args.num_steps, "duration_scale": 1.0}
+    if args.seconds is not None:
+        extra_params["seconds"] = args.seconds
     payload = {
         "model": args.model,
         "input": args.text,
         "instructions": args.instructions,
         "seed": args.seed,
         "response_format": "wav",
-        "extra_params": {"num_steps": args.num_steps, "duration_scale": 1.0},
+        "extra_params": extra_params,
     }
     if args.ref_audio:
         payload["ref_audio"] = [as_data_uri(path) for path in args.ref_audio]

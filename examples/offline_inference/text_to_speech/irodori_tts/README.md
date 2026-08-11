@@ -61,12 +61,18 @@ uv run --active --no-sync python tester.py \
   --output-wav outputs/irodori-vllm.wav
 ```
 
-It enables step execution by default. To exercise the initial continuous
-batch path, pass more than one `--text` together with an explicit duration:
+It enables step execution by default. To exercise predicted-duration
+continuous batching, pass more than one `--text` and set the active capacity:
 
 ```bash
 uv run --active --no-sync python tester.py \
   --checkpoint ../../../../../Aratako/Irodori-TTS-v4-Small/model.safetensors \
   --text '一つ目のリクエストです。' --text '二つ目のリクエストです。' \
-  --seconds 3 --max-num-seqs 2 --num-steps 4
+  --max-num-seqs 2 --num-steps 4
 ```
+
+Add `--seconds 3` when both requests should use the same explicit duration.
+CUDA graphs are also enabled by default. A shape runs eagerly once, is captured
+on its second denoise step, and is replayed after that. Use
+`--disable-cuda-graph` to compare against step-batched eager execution, or
+`--enforce-eager` to force the engine's eager mode.

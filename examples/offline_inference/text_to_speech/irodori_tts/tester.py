@@ -18,6 +18,7 @@ Exercise continuous batching with exact output lengths:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -68,7 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ref", action="store_true", help="Require text-only synthesis (command.txt compatibility).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-steps", type=int, default=40)
-    parser.add_argument("--seconds", type=float, default=None, help="Explicit output length. Required for a batch.")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Optional explicit output length; omit it to batch predicted durations.",
+    )
     parser.add_argument("--duration-scale", type=float, default=1.0)
     parser.add_argument("--cfg-scale-text", type=float, default=3.0)
     parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
@@ -82,6 +88,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(step_execution=True)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Disable Irodori CUDA graph capture while keeping step batching enabled.",
+    )
     parser.add_argument("--model-device", default="cuda", choices=["cuda"])
     parser.add_argument("--codec-device", default="cuda", choices=["cuda"])
     parser.add_argument("--model-precision", default="bf16", choices=["bf16", "fp32"])
@@ -156,9 +167,6 @@ def main() -> None:
         raise ValueError("--no-ref cannot be combined with --ref-wav/--ref-audio.")
     if args.max_num_seqs < 1:
         raise ValueError("--max-num-seqs must be at least one.")
-    if args.max_num_seqs > 1 and args.seconds is None:
-        raise ValueError("--seconds is required when --max-num-seqs is greater than one.")
-
     require_codec_bridge()
     model_source = resolve_model_source(args.model)
     texts = args.text or [DEFAULT_TEXT]
@@ -190,10 +198,13 @@ def main() -> None:
     print(f"Requests        : {len(prompts)}")
     print(f"Step execution  : {args.step_execution}")
     print(f"Max active seqs : {args.max_num_seqs}")
+    graph_enabled = not args.enforce_eager and not args.disable_cuda_graph
+    print(f"CUDA graphs     : {'enabled' if graph_enabled else 'disabled'}")
     print(f"Steps           : {args.num_steps}")
     print(f"Seconds         : {args.seconds if args.seconds is not None else 'predicted'}")
     print(f"References      : {len(references)}")
 
+    os.environ["VLLM_OMNI_IRODORI_CUDA_GRAPH"] = "1" if graph_enabled else "0"
     omni = Omni(
         model=model_source,
         model_class_name="IrodoriTTSPipeline",

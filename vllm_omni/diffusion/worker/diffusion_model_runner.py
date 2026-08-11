@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 import gc
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
@@ -46,8 +46,10 @@ from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
+    supports_fused_step_execution,
     supports_prompt_update,
     supports_step_execution,
+    supports_step_execution_partition,
 )
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
@@ -174,6 +176,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        self.input_batches: dict[Hashable | None, InputBatch] = {}
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
             vllm_config=vllm_config,
@@ -478,6 +481,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
+
+    def clear_cuda_graphs(self) -> None:
+        """Clear pipeline-owned manual graphs and step batch buffers."""
+        clear_graphs = getattr(self.pipeline, "clear_cuda_graphs", None)
+        if callable(clear_graphs):
+            clear_graphs()
+        input_batches = getattr(self, "input_batches", None)
+        if input_batches is not None:
+            input_batches.clear()
+        self.input_batch = None
 
     def get_prompt_embed_cache_stats(self) -> dict | None:
         """Return hit/miss statistics for the prompt-embedding cache, if enabled.
@@ -878,12 +891,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
-    def _prepare_batch_inputs(
+    def _prepare_new_step_states(
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
-    ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
-        # process new reqs
+    ) -> tuple[list[StepRequestState], list[RunnerOutput]]:
+        """Admit new requests before worker-side physical partitioning."""
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
         for state in states:
@@ -933,23 +946,54 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     )
                     continue
             prepared_states.append(state)
+        return prepared_states, error_outputs
 
-        if not prepared_states:
-            return prepared_states, None, error_outputs
+    def _partition_step_states(
+        self,
+        states: list[StepRequestState],
+    ) -> dict[Hashable | None, list[StepRequestState]]:
+        """Stable-partition active states by an optional pipeline-owned key."""
+        if not supports_step_execution_partition(self.pipeline):
+            return {None: states}
+        groups: dict[Hashable | None, list[StepRequestState]] = {}
+        for state in states:
+            key = self.pipeline.get_step_execution_key(state)
+            try:
+                hash(key)
+            except TypeError as exc:
+                raise TypeError(
+                    f"Step execution key for request {state.request_id} is not hashable: {key!r}."
+                ) from exc
+            groups.setdefault(key, []).append(state)
+        return groups
+
+    def _prepare_group_batch_inputs(
+        self,
+        states: list[StepRequestState],
+        execution_key: Hashable | None,
+    ) -> InputBatch:
+        input_batches = getattr(self, "input_batches", None)
+        if input_batches is None:
+            input_batches = {}
+            self.input_batches = input_batches
         input_batch = InputBatch.make_batch(
-            prepared_states,
-            cached_batch=getattr(self, "input_batch", None),
+            states,
+            cached_batch=input_batches.get(execution_key),
         )
+        input_batches[execution_key] = input_batch
         self.input_batch = input_batch
-        return prepared_states, input_batch, error_outputs
+        return input_batch
 
     def _update_states_after(
         self,
         states: list[StepRequestState],
         input_batch: InputBatch,
+        execution_key: Hashable | None,
         interrupted: bool = False,
+        failed_request_ids: set[str] | None = None,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
+        failed_request_ids = failed_request_ids or set()
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -960,11 +1004,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         else:
             input_batch.latents = gathered_latents.clone()
 
+        self.input_batches[execution_key] = input_batch
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
         for state in states:
-            if interrupted or state.request_denoise_completed:
+            if (
+                interrupted
+                or state.request_id in failed_request_ids
+                or state.request_denoise_completed
+            ):
                 self.state_cache.pop(state.request_id, None)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
@@ -1048,9 +1097,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
-            if input_batch is None:
-                return BatchRunnerOutput.from_list(runner_output_list)
+            states, error_outputs = self._prepare_new_step_states(states, new_request_ids)
+            if not states:
+                return BatchRunnerOutput.from_list(error_outputs)
+            state_groups = self._partition_step_states(states)
+            live_keys = set(state_groups)
+            self.input_batches = {
+                key: batch
+                for key, batch in getattr(self, "input_batches", {}).items()
+                if key in live_keys
+            }
             attn_metadata = {}
 
             with set_forward_context(
@@ -1058,37 +1114,87 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
-                for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
-                    )
+                runner_outputs_by_id: dict[str, RunnerOutput] = {}
+                failed_request_ids: set[str] = set()
 
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
+                for execution_key, group_states in state_groups.items():
+                    input_batch = self._prepare_group_batch_inputs(group_states, execution_key)
+                    fused_step = supports_fused_step_execution(self.pipeline)
+                    try:
+                        clear_pipeline_stage_durations(self.pipeline)
+                        if fused_step:
+                            self.pipeline.denoise_and_step(
+                                input_batch,
+                                states=group_states,
+                            )
+                            noise_pred = None
+                        else:
+                            noise_pred = self.pipeline.denoise_step(
+                                input_batch,
+                                states=group_states,
+                            )
+                    except Exception as group_exc:
+                        logger.error(
+                            "Stepwise microbatch error for key=%r: %s",
+                            execution_key,
+                            group_exc,
+                            exc_info=True,
+                        )
+                        for state in group_states:
+                            failed_request_ids.add(state.request_id)
+                            runner_outputs_by_id[state.request_id] = RunnerOutput(
+                                request_id=state.request_id,
+                                step_index=state.step_index,
+                                finished=True,
+                                result=DiffusionOutput(error=str(group_exc)),
+                            )
+                        self._update_states_after(
+                            group_states,
+                            input_batch,
+                            execution_key,
+                            failed_request_ids=failed_request_ids,
+                        )
+                        continue
+
+                    denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+                    for state in group_states:
+                        merge_stage_durations(state, denoise_stage_durations)
+
+                    group_interrupted = bool(getattr(self.pipeline, "interrupt", False))
+                    if not fused_step and noise_pred is None and group_interrupted:
+                        for state in group_states:
+                            runner_outputs_by_id[state.request_id] = RunnerOutput(
                                 request_id=state.request_id,
                                 step_index=state.step_index,
                                 finished=True,
                                 result=DiffusionOutput(error="stepwise denoise interrupted"),
                             )
+                        self._update_states_after(
+                            group_states,
+                            input_batch,
+                            execution_key,
+                            interrupted=True,
                         )
+                        continue
 
-                else:
                     offset = 0
-                    for req in states:
+                    for req in group_states:
                         row_num = req.latents.shape[0]
                         try:
-                            self.pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if not fused_step:
+                                self.pipeline.step_scheduler(
+                                    req,
+                                    (
+                                        noise_pred[offset : offset + row_num]
+                                        if noise_pred is not None
+                                        else None
+                                    ),
+                                )
                             if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed or req.request_denoise_completed
+                                should_decode = (
+                                    req.chunk_denoise_completed
+                                    or req.request_denoise_completed
+                                )
                             else:
                                 should_decode = req.denoise_completed
 
@@ -1096,50 +1202,53 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 clear_pipeline_stage_durations(self.pipeline)
                                 result = self.pipeline.post_decode(req)
                                 if result is not None:
-                                    self._attach_stepwise_metrics(
-                                        req,
-                                        result,
-                                    )
+                                    self._attach_stepwise_metrics(req, result)
                             else:
                                 result = None
-                            # finished should be computed after post_decode() advanced chunk_index
                             finished = (
                                 req.request_denoise_completed
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=finished,
-                                    result=result,
-                                )
+                            runner_outputs_by_id[req.request_id] = RunnerOutput(
+                                request_id=req.request_id,
+                                step_index=req.step_index,
+                                finished=finished,
+                                result=result,
                             )
-                            offset = offset + row_num
+                            offset += row_num
                         except Exception as per_req_exc:
-                            offset = offset + row_num
+                            offset += row_num
                             self.state_cache.pop(req.request_id, None)
+                            failed_request_ids.add(req.request_id)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,
                                 per_req_exc,
                                 exc_info=True,
                             )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=True,
-                                    result=DiffusionOutput.from_exception(per_req_exc),
-                                )
+                            runner_outputs_by_id[req.request_id] = RunnerOutput(
+                                request_id=req.request_id,
+                                step_index=req.step_index,
+                                finished=True,
+                                result=DiffusionOutput.from_exception(per_req_exc),
                             )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if not fused_step and noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
+                            f"but microbatch noise_pred has {noise_pred.shape[0]} rows."
                         )
+                    self._update_states_after(
+                        group_states,
+                        input_batch,
+                        execution_key,
+                        failed_request_ids=failed_request_ids,
+                    )
+
+                runner_output_list = [
+                    runner_outputs_by_id[state.request_id] for state in states
+                ] + error_outputs
 
                 if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -1160,7 +1269,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 terminal_request_ids = [
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
-                self._update_states_after(states, input_batch, pipeline_interrupted)
                 if (
                     getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                     is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -1168,6 +1276,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 ):
                     self.remove_diffusion_kv_requests(terminal_request_ids)
 
+                return BatchRunnerOutput.from_list(runner_output_list)
                 return BatchRunnerOutput.from_list(runner_output_list)
 
     def submit_interaction(

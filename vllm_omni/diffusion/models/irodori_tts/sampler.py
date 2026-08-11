@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .batching import IrodoriDenoiseBatch
 from .model import TextToLatentRFDiT
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
 
@@ -291,6 +292,7 @@ def prepare_euler_rf_cfg(
     initial_latents: torch.Tensor | None = None,
     condition_state: IrodoriConditionState | None = None,
     latent_mask: torch.Tensor | None = None,
+    bucket_sequence_length: int | None = None,
 ) -> IrodoriSamplingState:
     """Prepare request-local state without running a DiT denoise step."""
     device = model.device
@@ -299,6 +301,17 @@ def prepare_euler_rf_cfg(
     latent_dim = model.cfg.patched_latent_dim
     if isinstance(sequence_length, bool) or not isinstance(sequence_length, int) or sequence_length <= 0:
         raise ValueError(f"sequence_length must be a positive integer, got {sequence_length!r}.")
+    if bucket_sequence_length is None:
+        bucket_sequence_length = sequence_length
+    if (
+        isinstance(bucket_sequence_length, bool)
+        or not isinstance(bucket_sequence_length, int)
+        or bucket_sequence_length < sequence_length
+    ):
+        raise ValueError(
+            "bucket_sequence_length must be an integer greater than or equal to "
+            f"sequence_length, got {bucket_sequence_length!r}."
+        )
     if isinstance(num_steps, bool) or not isinstance(num_steps, int) or not 1 <= num_steps <= 100:
         raise ValueError(f"num_steps must be an integer in [1, 100], got {num_steps!r}.")
     for name, value in (
@@ -342,6 +355,31 @@ def prepare_euler_rf_cfg(
         x_t = initial_latents
     if truncation_factor is not None:
         x_t = x_t * float(truncation_factor)
+
+    if latent_mask is not None:
+        if tuple(latent_mask.shape) != (batch_size, sequence_length):
+            raise ValueError(
+                "latent_mask shape mismatch: "
+                f"expected {(batch_size, sequence_length)}, got {tuple(latent_mask.shape)}."
+            )
+        latent_mask = latent_mask.to(device=device, dtype=torch.bool)
+    if bucket_sequence_length > sequence_length:
+        if latent_mask is None:
+            latent_mask = torch.ones(
+                (batch_size, sequence_length),
+                dtype=torch.bool,
+                device=device,
+            )
+        latent_tail = x_t.new_zeros(
+            (batch_size, bucket_sequence_length - sequence_length, latent_dim)
+        )
+        mask_tail = torch.zeros(
+            (batch_size, bucket_sequence_length - sequence_length),
+            dtype=torch.bool,
+            device=device,
+        )
+        x_t = torch.cat((x_t, latent_tail), dim=1)
+        latent_mask = torch.cat((latent_mask, mask_tail), dim=1)
 
     if cfg_scale is not None:
         # Backward compatibility for old single-scale caller.
@@ -881,6 +919,65 @@ def predict_euler_rf_cfg_batch(
 
 
 @torch.inference_mode()
+def run_packed_euler_rf_cfg_step(
+    model: TextToLatentRFDiT,
+    batch: IrodoriDenoiseBatch,
+) -> torch.Tensor:
+    """Run one packed independent-CFG DiT forward and masked Euler update."""
+    request_count = len(batch.request_ids)
+    if batch.latents.shape[0] != request_count:
+        raise ValueError("Packed Irodori execution expects one latent row per request.")
+
+    if batch.cfg_active:
+        cfg_rows = len(batch.cfg_layout)
+        model_latents = (
+            batch.latents[:, None]
+            .expand(request_count, cfg_rows, *batch.latents.shape[1:])
+            .reshape(request_count * cfg_rows, *batch.latents.shape[1:])
+            .to(model.dtype)
+        )
+        model_timesteps = (
+            batch.timesteps[:, None]
+            .expand(request_count, cfg_rows)
+            .reshape(request_count * cfg_rows)
+            .to(device=model.device, dtype=model.dtype)
+        )
+        model_mask = (
+            batch.latent_mask[:, None]
+            .expand(request_count, cfg_rows, batch.latent_mask.shape[1])
+            .reshape(request_count * cfg_rows, batch.latent_mask.shape[1])
+        )
+        prediction = _forward_with_bundle(
+            model,
+            x_t=model_latents,
+            t=model_timesteps,
+            bundle=batch.bundle,
+            latent_mask=model_mask,
+            context_kv_cache=batch.context_kv_cache,
+        ).reshape(request_count, cfg_rows, *batch.latents.shape[1:])
+        conditional = prediction[:, 0]
+        if cfg_rows > 1:
+            deltas = conditional[:, None] - prediction[:, 1:]
+            velocity = conditional + (
+                deltas * batch.cfg_scales[:, :, None, None]
+            ).sum(dim=1)
+        else:
+            velocity = conditional
+    else:
+        velocity = _forward_with_bundle(
+            model,
+            x_t=batch.latents.to(model.dtype),
+            t=batch.timesteps.to(device=model.device, dtype=model.dtype),
+            bundle=batch.bundle,
+            latent_mask=batch.latent_mask,
+            context_kv_cache=batch.context_kv_cache,
+        )
+
+    next_latents = batch.latents + velocity * batch.dt[:, None, None]
+    return next_latents.masked_fill(~batch.latent_mask[:, :, None], 0)
+
+
+@torch.inference_mode()
 def apply_euler_rf_cfg_step(
     state: IrodoriSamplingState,
     prediction: torch.Tensor,
@@ -924,6 +1021,8 @@ def apply_euler_rf_cfg_step(
             )
         state.speaker_kv_active = False
     state.latents = state.latents + velocity * (t_next - t)
+    if state.latent_mask is not None:
+        state.latents.masked_fill_(~state.latent_mask[:, :, None], 0)
     state.step_index += 1
 
 

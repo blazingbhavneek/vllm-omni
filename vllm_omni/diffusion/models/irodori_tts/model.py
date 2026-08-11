@@ -52,7 +52,7 @@ def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
     freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
+        -math.log(10000.0)
         * torch.arange(half, device=timestep.device, dtype=torch.float32)
         / half
     )
@@ -2106,4 +2106,3 @@ class TextToLatentRFDiT(nn.Module):
 
     def as_dict(self) -> dict:
         return asdict(self.cfg)
-
