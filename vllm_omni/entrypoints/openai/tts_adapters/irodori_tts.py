@@ -25,7 +25,19 @@ _NUMERIC_OPTIONS: dict[str, tuple[float, float, bool]] = {
     "cfg_scale_text": (0.0, 10.0, False),
     "cfg_scale_caption": (0.0, 10.0, False),
     "cfg_scale_speaker": (0.0, 10.0, False),
+    "cfg_refresh_interval": (1, 100, True),
 }
+
+_FORWARDED_EXTRAS = frozenset(
+    {
+        "seconds",
+        "duration_scale",
+        "cfg_scale_text",
+        "cfg_scale_caption",
+        "cfg_scale_speaker",
+        "cfg_refresh_interval",
+    }
+)
 
 
 @register_tts_adapter
@@ -128,8 +140,6 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
         elif "seed" in extras:
             params.seed = int(extras.pop("seed"))
         params.extra_args = {
-            key: value
-            for key, value in extras.items()
-            if key in {"seconds", "duration_scale", "cfg_scale_text", "cfg_scale_caption", "cfg_scale_speaker"}
+            key: value for key, value in extras.items() if key in _FORWARDED_EXTRAS
         }
         return result

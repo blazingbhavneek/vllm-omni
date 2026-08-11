@@ -150,6 +150,7 @@ class _IrodoriPreparedRequest:
     sampling_state: IrodoriSamplingState
     lengths: IrodoriLengthState
     output_type: str
+    cfg_refresh_interval: int = 1
 
 
 class IrodoriTTSPipeline(
@@ -182,6 +183,7 @@ class IrodoriTTSPipeline(
             "cfg_scale_text",
             "cfg_scale_caption",
             "cfg_scale_speaker",
+            "cfg_refresh_interval",
         }
     )
 
@@ -413,6 +415,16 @@ class IrodoriTTSPipeline(
             "duration_scale": self._finite_float(
                 extra.get("duration_scale", 1.0), name="duration_scale", minimum=0.25, maximum=4.0
             ),
+            # Per-request so fidelity can be compared without a server restart.
+            "cfg_refresh_interval": self._positive_int(
+                extra.get(
+                    "cfg_refresh_interval",
+                    self.batching_config.cfg_refresh_interval,
+                ),
+                name="cfg_refresh_interval",
+                minimum=1,
+                maximum=100,
+            ),
             "cfg_scale_text": self._finite_float(
                 extra.get("cfg_scale_text", 3.0), name="cfg_scale_text", minimum=0.0, maximum=10.0
             ),
@@ -525,6 +537,7 @@ class IrodoriTTSPipeline(
             ),
             lengths=lengths,
             output_type=options["output_type"],
+            cfg_refresh_interval=options["cfg_refresh_interval"],
         )
 
     def _decode_prepared_request(
@@ -577,7 +590,33 @@ class IrodoriTTSPipeline(
             device_index=device.index,
             cfg_guidance_mode=sampling_state.cfg_guidance_mode,
             cfg_layout=sampling_state.independent_names if cfg_active else ("cond",),
+            cfg_refresh=self._needs_cfg_refresh(
+                sampling_state,
+                cfg_active,
+                prepared.cfg_refresh_interval,
+            ),
         )
+
+    @staticmethod
+    def _needs_cfg_refresh(
+        sampling_state: IrodoriSamplingState,
+        cfg_active: bool,
+        interval: int,
+    ) -> bool:
+        """Whether this step must recompute the unconditional CFG branches.
+
+        Refreshing and reusing requests cannot share a physical forward, so
+        this feeds the execution key and splits them into separate
+        microbatches.
+        """
+        if not cfg_active:
+            return True
+        if interval <= 1:
+            return True
+        # A request without a carried-over correction has nothing to reuse.
+        if sampling_state.cfg_correction is None:
+            return True
+        return sampling_state.step_index % interval == 0
 
     def denoise_step(
         self,
@@ -665,6 +704,7 @@ class IrodoriTTSPipeline(
                 prepared.lengths.is_dynamic_bucket for prepared in prepared_requests
             ),
             cached_batch=cached_batch,
+            cfg_refresh=execution_key.cfg_refresh,
         )
         self._denoise_batches[execution_key] = denoise_batch
         self._denoise_batches.move_to_end(execution_key)
@@ -677,12 +717,17 @@ class IrodoriTTSPipeline(
             denoise_batch,
             run_packed_euler_rf_cfg_step,
         )
+        refreshed_correction = (
+            denoise_batch.cfg_correction if execution_key.cfg_refresh else None
+        )
         for index, (state, sampling_state) in enumerate(
             zip(states, sampling_states, strict=True)
         ):
             # Graph outputs are shared fixed buffers, so each request owns a copy.
             request_latents = next_latents[index : index + 1].clone()
             sampling_state.latents = request_latents
+            if refreshed_correction is not None:
+                sampling_state.cfg_correction = refreshed_correction[index : index + 1].clone()
             sampling_state.step_index += 1
             state.latents = request_latents
             state.step_index += 1

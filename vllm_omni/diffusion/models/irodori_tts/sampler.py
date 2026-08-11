@@ -129,6 +129,7 @@ ConditionBundle = tuple[
     torch.Tensor | None,
 ]
 ContextKVCache = list[tuple[torch.Tensor, ...]]
+BundlePrefixLengths = tuple[int | None, int | None, int | None]
 
 
 @dataclass(frozen=True)
@@ -169,8 +170,17 @@ class IrodoriSamplingState:
     speaker_kv_max_layers: int | None
     speaker_kv_min_t: float | None
     speaker_kv_active: bool
+    cond_prefix_lengths: BundlePrefixLengths
+    independent_prefix_lengths: BundlePrefixLengths
     latent_mask: torch.Tensor | None = None
     step_index: int = 0
+    # Scaled CFG correction carried over from the last refresh step, so
+    # intermediate steps can skip the unconditional branches.
+    cfg_correction: torch.Tensor | None = None
+
+    def bundle_prefix_lengths(self, cfg_active: bool) -> BundlePrefixLengths:
+        """Return the precomputed prefix lengths for the bundle in use."""
+        return self.independent_prefix_lengths if cfg_active else self.cond_prefix_lengths
 
     @property
     def total_steps(self) -> int:
@@ -255,6 +265,28 @@ def _cat_optional_tensors(values: list[torch.Tensor | None]) -> torch.Tensor | N
     if len(present) != len(values):
         raise ValueError("Cannot concatenate optional condition tensors with mixed presence.")
     return torch.cat(present, dim=0)
+
+
+def _bundle_prefix_lengths(bundle: ConditionBundle) -> BundlePrefixLengths:
+    """Valid text/speaker/caption prefix lengths for one request's bundle.
+
+    Each entry is ``None`` when that context source is absent.  The masks are
+    fixed for a request's lifetime, so this device sync runs once during
+    preparation instead of once per source per request per denoise step.
+    """
+    lengths: list[int | None] = []
+    for state_index, mask_index in ((0, 1), (2, 3), (4, 5)):
+        tensor = bundle[state_index]
+        if tensor is None:
+            lengths.append(None)
+            continue
+        mask = bundle[mask_index]
+        if mask is None:
+            lengths.append(int(tensor.shape[1]))
+            continue
+        active = torch.nonzero(mask.any(dim=0), as_tuple=False)
+        lengths.append(1 if active.numel() == 0 else int(active[-1, 0].item()) + 1)
+    return (lengths[0], lengths[1], lengths[2])
 
 
 @torch.inference_mode()
@@ -639,6 +671,14 @@ def prepare_euler_rf_cfg(
                 max_layers=speaker_kv_max_layers,
             )
     cfg_active_values = t_schedule[:-1].detach().float().cpu().tolist()
+    independent_bundle = _bundle(
+        text_state=independent_text_state,
+        text_mask=independent_text_mask,
+        speaker_state=independent_speaker_state,
+        speaker_mask=independent_speaker_mask,
+        caption_state=independent_caption_state,
+        caption_mask=independent_caption_mask,
+    )
     return IrodoriSamplingState(
         latents=x_t,
         t_schedule=t_schedule,
@@ -648,14 +688,7 @@ def prepare_euler_rf_cfg(
         ),
         condition=condition,
         cond_bundle=cond_bundle,
-        independent_bundle=(
-            independent_text_state,
-            independent_text_mask,
-            independent_speaker_state,
-            independent_speaker_mask,
-            independent_caption_state,
-            independent_caption_mask,
-        ),
+        independent_bundle=independent_bundle,
         independent_names=tuple(independent_names),
         cfg_scales=cfg_scales,
         cfg_guidance_mode=cfg_guidance_mode,
@@ -672,6 +705,8 @@ def prepare_euler_rf_cfg(
         speaker_kv_max_layers=speaker_kv_max_layers,
         speaker_kv_min_t=speaker_kv_min_t,
         speaker_kv_active=speaker_kv_scale is not None,
+        cond_prefix_lengths=_bundle_prefix_lengths(cond_bundle),
+        independent_prefix_lengths=_bundle_prefix_lengths(independent_bundle),
         latent_mask=latent_mask,
     )
 
@@ -918,6 +953,52 @@ def predict_euler_rf_cfg_batch(
     return result
 
 
+def _conditional_rows(
+    bundle: ConditionBundle,
+    request_count: int,
+    cfg_rows: int,
+) -> ConditionBundle:
+    """Keep only each request's conditional row from a packed CFG bundle.
+
+    ``_pack_bundles`` lays rows out request-major, so request ``i``'s
+    conditional branch is row ``i * cfg_rows``.
+    """
+    selected = []
+    for value in bundle:
+        if value is None:
+            selected.append(None)
+            continue
+        if value.shape[0] != request_count * cfg_rows:
+            raise ValueError(
+                "Packed Irodori bundle row count does not match the CFG layout: "
+                f"expected {request_count * cfg_rows}, got {value.shape[0]}."
+            )
+        selected.append(value[::cfg_rows].contiguous())
+    return (selected[0], selected[1], selected[2], selected[3], selected[4], selected[5])
+
+
+def _conditional_context_kv(
+    context_kv_cache: ContextKVCache | None,
+    request_count: int,
+    cfg_rows: int,
+) -> ContextKVCache | None:
+    """Keep only each request's conditional row from a packed context K/V cache."""
+    if context_kv_cache is None:
+        return None
+    selected: ContextKVCache = []
+    for layer in context_kv_cache:
+        rows = []
+        for value in layer:
+            if value.shape[0] != request_count * cfg_rows:
+                raise ValueError(
+                    "Packed Irodori context K/V row count does not match the CFG layout: "
+                    f"expected {request_count * cfg_rows}, got {value.shape[0]}."
+                )
+            rows.append(value[::cfg_rows].contiguous())
+        selected.append(tuple(rows))
+    return selected
+
+
 @torch.inference_mode()
 def run_packed_euler_rf_cfg_step(
     model: TextToLatentRFDiT,
@@ -927,6 +1008,25 @@ def run_packed_euler_rf_cfg_step(
     request_count = len(batch.request_ids)
     if batch.latents.shape[0] != request_count:
         raise ValueError("Packed Irodori execution expects one latent row per request.")
+
+    if batch.cfg_active and not batch.cfg_refresh:
+        # Reuse step: only the conditional branch runs.  The scaled correction
+        # from the last refresh stands in for the unconditional branches.
+        if batch.cfg_correction is None:
+            raise ValueError("Irodori CFG reuse step requires a cached correction.")
+        conditional = _forward_with_bundle(
+            model,
+            x_t=batch.latents.to(model.dtype),
+            t=batch.timesteps.to(device=model.device, dtype=model.dtype),
+            bundle=_conditional_rows(batch.bundle, request_count, len(batch.cfg_layout)),
+            latent_mask=batch.latent_mask,
+            context_kv_cache=_conditional_context_kv(
+                batch.context_kv_cache, request_count, len(batch.cfg_layout)
+            ),
+        )
+        velocity = conditional + batch.cfg_correction
+        next_latents = batch.latents + velocity * batch.dt[:, None, None]
+        return next_latents.masked_fill(~batch.latent_mask[:, :, None], 0)
 
     if batch.cfg_active:
         cfg_rows = len(batch.cfg_layout)
@@ -958,9 +1058,11 @@ def run_packed_euler_rf_cfg_step(
         conditional = prediction[:, 0]
         if cfg_rows > 1:
             deltas = conditional[:, None] - prediction[:, 1:]
-            velocity = conditional + (
-                deltas * batch.cfg_scales[:, :, None, None]
-            ).sum(dim=1)
+            correction = (deltas * batch.cfg_scales[:, :, None, None]).sum(dim=1)
+            if batch.cfg_correction is not None:
+                # Carried forward so later reuse steps can skip these branches.
+                batch.cfg_correction.copy_(correction)
+            velocity = conditional + correction
         else:
             velocity = conditional
     else:

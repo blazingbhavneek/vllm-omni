@@ -97,6 +97,9 @@ class IrodoriExecutionKey:
     device_index: int | None
     cfg_guidance_mode: str
     cfg_layout: tuple[str, ...]
+    # Refreshing requests run every CFG branch; reusing requests run only the
+    # conditional branch, so the two cannot share one physical forward.
+    cfg_refresh: bool = True
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,7 @@ class IrodoriGraphKey:
     caption_context_bucket: int
     cfg_active: bool
     cfg_layout: tuple[str, ...]
+    cfg_refresh: bool = True
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,7 @@ class IrodoriBatchingConfig:
     cuda_graph_max_dynamic_entries: int
     cuda_graph_min_hits: int
     enable_cuda_graph: bool
+    cfg_refresh_interval: int
 
     @classmethod
     def from_od_config(cls, od_config: Any) -> IrodoriBatchingConfig:
@@ -188,6 +193,13 @@ class IrodoriBatchingConfig:
                 name="irodori_cuda_graph_min_hits",
             ),
             enable_cuda_graph=enable_graph,
+            # 1 recomputes every CFG branch on every step, matching the
+            # reference sampler exactly.  Higher values reuse the last
+            # correction in between and trade fidelity for speed.
+            cfg_refresh_interval=_positive_int(
+                extras.get("irodori_cfg_refresh_interval", 1),
+                name="irodori_cfg_refresh_interval",
+            ),
         )
 
 
@@ -282,15 +294,6 @@ class IrodoriContextBucketPolicy:
         return _round_up(valid_length, self.standard_buckets[-1]), True
 
 
-def _logical_prefix_len(mask: torch.Tensor | None, fallback: int) -> int:
-    if mask is None:
-        return fallback
-    active = torch.nonzero(mask.any(dim=0), as_tuple=False)
-    if active.numel() == 0:
-        return 1
-    return int(active[-1, 0].item()) + 1
-
-
 def _pad_sequence(value: torch.Tensor, target: int) -> torch.Tensor:
     if value.shape[1] < target:
         shape = list(value.shape)
@@ -312,23 +315,19 @@ def _pack_optional(values: Sequence[torch.Tensor | None], target: int) -> torch.
 
 
 def _source_bucket(
-    bundles: Sequence[ConditionBundle],
+    prefix_lengths: Sequence[int | None],
     *,
-    state_index: int,
-    mask_index: int,
     policy: IrodoriContextBucketPolicy,
 ) -> tuple[int, bool]:
-    tensors = [bundle[state_index] for bundle in bundles]
-    masks = [bundle[mask_index] for bundle in bundles]
-    present_tensors = [tensor for tensor in tensors if tensor is not None]
-    if not present_tensors:
+    """Pick one context bucket from per-request prefix lengths.
+
+    The lengths come precomputed from ``IrodoriSamplingState`` so that
+    selecting a bucket costs no device synchronization on the step path.
+    """
+    present = [length for length in prefix_lengths if length is not None]
+    if not present:
         return 1, False
-    valid_length = max(
-        _logical_prefix_len(mask, tensor.shape[1])
-        for tensor, mask in zip(tensors, masks, strict=True)
-        if tensor is not None
-    )
-    return policy.select_bucket(valid_length)
+    return policy.select_bucket(max(present))
 
 
 def _pack_bundles(
@@ -412,6 +411,11 @@ class IrodoriDenoiseBatch:
     context_buckets: tuple[int, int, int]
     dynamic_context_buckets: tuple[bool, bool, bool]
     is_dynamic_latent_bucket: bool
+    # On a refresh step the packed step writes the scaled CFG correction here;
+    # on a reuse step it reads the correction carried over from the last
+    # refresh instead of running the unconditional branches again.
+    cfg_refresh: bool = True
+    cfg_correction: torch.Tensor | None = None
 
     @property
     def graph_key(self) -> IrodoriGraphKey:
@@ -427,6 +431,7 @@ class IrodoriDenoiseBatch:
             caption_context_bucket=self.context_buckets[2],
             cfg_active=self.cfg_active,
             cfg_layout=self.cfg_layout,
+            cfg_refresh=self.cfg_refresh,
         )
 
     @property
@@ -446,6 +451,7 @@ class IrodoriDenoiseBatch:
         context_policy: IrodoriContextBucketPolicy,
         is_dynamic_latent_bucket: bool,
         cached_batch: IrodoriDenoiseBatch | None = None,
+        cfg_refresh: bool = True,
     ) -> IrodoriDenoiseBatch:
         if not states or len(request_ids) != len(states):
             raise ValueError("Irodori packed batch requires matching non-empty request/state lists.")
@@ -458,22 +464,17 @@ class IrodoriDenoiseBatch:
 
         bundles = [state.independent_bundle if cfg_active else state.cond_bundle for state in states]
         caches = [state.context_kv_cfg if cfg_active else state.context_kv_cond for state in states]
+        prefix_lengths = [state.bundle_prefix_lengths(cfg_active) for state in states]
         text_bucket = _source_bucket(
-            bundles,
-            state_index=0,
-            mask_index=1,
+            [lengths[0] for lengths in prefix_lengths],
             policy=context_policy,
         )
         speaker_bucket = _source_bucket(
-            bundles,
-            state_index=2,
-            mask_index=3,
+            [lengths[1] for lengths in prefix_lengths],
             policy=context_policy,
         )
         caption_bucket = _source_bucket(
-            bundles,
-            state_index=4,
-            mask_index=5,
+            [lengths[2] for lengths in prefix_lengths],
             policy=context_policy,
         )
         context_buckets = (text_bucket[0], speaker_bucket[0], caption_bucket[0])
@@ -500,6 +501,27 @@ class IrodoriDenoiseBatch:
             len(states), len(scale_names)
         )
 
+        reuses_correction = bool(cfg_active) and not cfg_refresh
+        if reuses_correction:
+            missing = [
+                request_id
+                for request_id, state in zip(request_ids, states, strict=True)
+                if state.cfg_correction is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Irodori CFG reuse step is missing a cached correction for: {missing}."
+                )
+            cfg_correction = torch.cat(
+                [state.cfg_correction for state in states],  # type: ignore[misc]
+                dim=0,
+            )
+        elif cfg_active:
+            # Refresh step: the packed step writes the fresh correction here.
+            cfg_correction = torch.zeros_like(latents)
+        else:
+            cfg_correction = None
+
         can_reuse = (
             cached_batch is not None
             and cached_batch.request_ids == tuple(request_ids)
@@ -507,6 +529,8 @@ class IrodoriDenoiseBatch:
             and cached_batch.cfg_layout == cfg_layout
             and cached_batch.context_buckets == context_buckets
             and cached_batch.latents.shape == latents.shape
+            and cached_batch.cfg_refresh == cfg_refresh
+            and (cached_batch.cfg_correction is None) == (cfg_correction is None)
         )
         if can_reuse:
             assert cached_batch is not None
@@ -515,6 +539,9 @@ class IrodoriDenoiseBatch:
             cached_batch.timesteps.copy_(timesteps)
             cached_batch.dt.copy_(dt)
             cached_batch.cfg_scales.copy_(cfg_scales)
+            if cached_batch.cfg_correction is not None:
+                assert cfg_correction is not None
+                cached_batch.cfg_correction.copy_(cfg_correction)
             return cached_batch
 
         return cls(
@@ -531,6 +558,8 @@ class IrodoriDenoiseBatch:
             context_buckets=context_buckets,
             dynamic_context_buckets=dynamic_context,
             is_dynamic_latent_bucket=bool(is_dynamic_latent_bucket),
+            cfg_refresh=bool(cfg_refresh),
+            cfg_correction=None if cfg_correction is None else cfg_correction.contiguous(),
         )
 
     def clone(self) -> IrodoriDenoiseBatch:
@@ -552,6 +581,8 @@ class IrodoriDenoiseBatch:
             context_buckets=self.context_buckets,
             dynamic_context_buckets=self.dynamic_context_buckets,
             is_dynamic_latent_bucket=self.is_dynamic_latent_bucket,
+            cfg_refresh=self.cfg_refresh,
+            cfg_correction=None if self.cfg_correction is None else self.cfg_correction.clone(),
         )
 
     def copy_dynamic_from(self, source: IrodoriDenoiseBatch) -> None:
@@ -560,6 +591,7 @@ class IrodoriDenoiseBatch:
         self.timesteps.copy_(source.timesteps)
         self.dt.copy_(source.dt)
         self.cfg_scales.copy_(source.cfg_scales)
+        _copy_optional_tensor(self.cfg_correction, source.cfg_correction)
 
     def copy_static_from(self, source: IrodoriDenoiseBatch) -> None:
         for destination, value in zip(self.bundle, source.bundle, strict=True):
@@ -583,6 +615,7 @@ class IrodoriDenoiseBatch:
             self.timesteps,
             self.dt,
             self.cfg_scales,
+            *(value for value in (self.cfg_correction,) if value is not None),
             *(value for value in self.bundle if value is not None),
         ]
         if self.context_kv_cache is not None:
