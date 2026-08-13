@@ -37,9 +37,10 @@ Install the optional CUDA 13 extra:
 pip install 'vllm-omni[fa4]'
 ```
 
-Version `4.0.0b18` is required; earlier beta wheels had known JIT failures on
-Blackwell. If the CuTe path is unavailable, the backend falls back to the
-compatible FlashAttention 3 or 2 path.
+Version `4.0.0b26` is required; older beta wheels have known dense and
+variable-length JIT failures on consumer Blackwell. If the CuTe path is
+unavailable, the backend falls back to the compatible FlashAttention 3 or 2
+path.
 
 ## `CUDNN_ATTN`
 

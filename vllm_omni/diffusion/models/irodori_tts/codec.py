@@ -12,6 +12,8 @@ from pathlib import Path
 
 import torch
 
+from .precision import IEEE, IrodoriPrecisionPolicy, matmul_precision
+
 _CODEC_DEFAULT = object()
 
 
@@ -49,6 +51,13 @@ class DACVAECodec:
     deterministic_encode: bool
     deterministic_decode: bool
     normalize_db: float | None
+    # Installed by the pipeline. ``None`` keeps strict IEEE FP32 convolutions.
+    precision_policy: IrodoriPrecisionPolicy | None = None
+
+    def _matmul_mode(self) -> str:
+        if self.precision_policy is None:
+            return IEEE
+        return self.precision_policy.codec_matmul
 
     @classmethod
     def load(
@@ -266,6 +275,12 @@ class DACVAECodec:
             waveform = torch.stack(processed, dim=0).unsqueeze(1)
 
         waveform = waveform.to(self.device, dtype=self.dtype)
+        # Resampling and loudness normalization above stay in strict FP32; only
+        # the convolutional encode below is allowed onto tensor cores.
+        with matmul_precision(self._matmul_mode()):
+            return self._encode_prepared(waveform)
+
+    def _encode_prepared(self, waveform: torch.Tensor) -> torch.Tensor:
         if self.deterministic_encode:
             required_paths_present = (
                 hasattr(self.model, "encoder")
@@ -295,7 +310,10 @@ class DACVAECodec:
         if latent.ndim != 3:
             raise ValueError(f"Expected latent ndim=3, got shape={tuple(latent.shape)}")
         z = latent.transpose(1, 2).contiguous().to(self.device, dtype=self.dtype)  # (B, D, T)
-        return self.model.decode(z)
+        # The DACVAE decoder is dominated by FP32 convolutions; TF32 moves them
+        # onto tensor cores without changing weights or the output shape.
+        with matmul_precision(self._matmul_mode()):
+            return self.model.decode(z)
 
     def encode_file(self, path: str | Path) -> torch.Tensor:
         try:

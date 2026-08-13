@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -129,6 +129,8 @@ ConditionBundle = tuple[
     torch.Tensor | None,
 ]
 ContextKVCache = list[tuple[torch.Tensor, ...]]
+PackedContextKVCache = list[tuple[torch.Tensor, torch.Tensor]]
+PackedContextState = tuple[PackedContextKVCache, tuple[int, ...]]
 BundlePrefixLengths = tuple[int | None, int | None, int | None]
 
 
@@ -172,11 +174,17 @@ class IrodoriSamplingState:
     speaker_kv_active: bool
     cond_prefix_lengths: BundlePrefixLengths
     independent_prefix_lengths: BundlePrefixLengths
+    valid_latent_lengths: tuple[int, ...]
     latent_mask: torch.Tensor | None = None
     step_index: int = 0
     # Scaled CFG correction carried over from the last refresh step, so
     # intermediate steps can skip the unconditional branches.
     cfg_correction: torch.Tensor | None = None
+    # Lazily materialized exact, source-interleaved context K/V for packed
+    # varlen attention.  It is request-static and reused for all 40 steps.
+    packed_context_cache: dict[tuple[str, torch.dtype], PackedContextState] = field(
+        default_factory=dict
+    )
 
     def bundle_prefix_lengths(self, cfg_active: bool) -> BundlePrefixLengths:
         """Return the precomputed prefix lengths for the bundle in use."""
@@ -707,6 +715,7 @@ def prepare_euler_rf_cfg(
         speaker_kv_active=speaker_kv_scale is not None,
         cond_prefix_lengths=_bundle_prefix_lengths(cond_bundle),
         independent_prefix_lengths=_bundle_prefix_lengths(independent_bundle),
+        valid_latent_lengths=(sequence_length,) * batch_size,
         latent_mask=latent_mask,
     )
 
@@ -870,6 +879,251 @@ def _collate_context_kv_caches(caches: list[ContextKVCache | None]) -> ContextKV
             )
         )
     return result
+
+
+def _pack_state_context(
+    state: IrodoriSamplingState,
+    *,
+    mode: str,
+    attention_dtype: torch.dtype,
+) -> PackedContextState:
+    """Pack one request's static context in logical CFG-row order."""
+    cache_key = (mode, attention_dtype)
+    cached = state.packed_context_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if mode == "cfg":
+        bundle = state.independent_bundle
+        context_kv_cache = state.context_kv_cfg
+    elif mode == "cond":
+        bundle = state.cond_bundle
+        context_kv_cache = state.context_kv_cond
+    else:
+        raise ValueError(f"Unsupported packed Irodori context mode: {mode!r}.")
+    if context_kv_cache is None:
+        raise ValueError("Packed Irodori execution requires the static context K/V cache.")
+
+    source_states = (bundle[0], bundle[2], bundle[4])
+    source_masks = (bundle[1], bundle[3], bundle[5])
+    row_count = bundle[0].shape[0]
+    if any(
+        source is not None and source.shape[0] != row_count
+        for source in source_states
+    ) or any(mask is not None and mask.shape[0] != row_count for mask in source_masks):
+        raise ValueError("Packed Irodori context masks have inconsistent row counts.")
+
+    row_source_indices: list[list[torch.Tensor]] = []
+    context_lengths: list[int] = []
+    for row in range(row_count):
+        source_indices: list[torch.Tensor] = []
+        total = 0
+        for source, mask in zip(source_states, source_masks, strict=True):
+            if source is None:
+                source_indices.append(torch.empty(0, dtype=torch.long, device=state.latents.device))
+                continue
+            indices = (
+                torch.arange(source.shape[1], dtype=torch.long, device=source.device)
+                if mask is None
+                else torch.nonzero(mask[row], as_tuple=False).flatten()
+            )
+            source_indices.append(indices)
+            total += int(indices.numel())
+        row_source_indices.append(source_indices)
+        context_lengths.append(total)
+
+    packed_layers: PackedContextKVCache = []
+    for layer in context_kv_cache:
+        expected_width = 2 * sum(source is not None for source in source_states)
+        if len(layer) != expected_width:
+            raise ValueError("Packed Irodori context K/V layout does not match its masks.")
+        packed_k_rows: list[torch.Tensor] = []
+        packed_v_rows: list[torch.Tensor] = []
+        for row, source_indices in enumerate(row_source_indices):
+            row_k: list[torch.Tensor] = []
+            row_v: list[torch.Tensor] = []
+            cache_offset = 0
+            for source, indices in zip(source_states, source_indices, strict=True):
+                if source is None:
+                    continue
+                row_k.append(layer[cache_offset][row].index_select(0, indices))
+                row_v.append(layer[cache_offset + 1][row].index_select(0, indices))
+                cache_offset += 2
+            packed_k_rows.append(torch.cat(row_k, dim=0))
+            packed_v_rows.append(torch.cat(row_v, dim=0))
+        packed_layers.append(
+            (
+                torch.cat(packed_k_rows, dim=0)
+                .unsqueeze(0)
+                .to(dtype=attention_dtype)
+                .contiguous(),
+                torch.cat(packed_v_rows, dim=0)
+                .unsqueeze(0)
+                .to(dtype=attention_dtype)
+                .contiguous(),
+            )
+        )
+
+    result = (packed_layers, tuple(context_lengths))
+    state.packed_context_cache[cache_key] = result
+    return result
+
+
+def _pack_batch_context(
+    states: list[IrodoriSamplingState],
+    *,
+    mode: str,
+    attention_dtype: torch.dtype,
+) -> PackedContextState:
+    request_contexts = [
+        _pack_state_context(
+            state,
+            mode=mode,
+            attention_dtype=attention_dtype,
+        )
+        for state in states
+    ]
+    context_lengths = tuple(
+        length
+        for _, lengths in request_contexts
+        for length in lengths
+    )
+    layer_count = len(request_contexts[0][0])
+    if any(len(context[0]) != layer_count for context in request_contexts[1:]):
+        raise ValueError("Packed Irodori context K/V layer counts differ across requests.")
+    packed_layers: PackedContextKVCache = []
+    for layer_index in range(layer_count):
+        packed_layers.append(
+            (
+                torch.cat(
+                    [context[0][layer_index][0] for context in request_contexts],
+                    dim=1,
+                ).contiguous(),
+                torch.cat(
+                    [context[0][layer_index][1] for context in request_contexts],
+                    dim=1,
+                ).contiguous(),
+            )
+        )
+    return packed_layers, context_lengths
+
+
+def supports_packed_euler_rf_cfg_batch(
+    model: TextToLatentRFDiT,
+    states: list[IrodoriSamplingState],
+) -> bool:
+    """Whether ``states`` can use the exact-token packed DiT path."""
+    return bool(
+        states
+        and model.supports_packed_varlen_attention()
+        and all(state.cfg_guidance_mode == "independent" for state in states)
+        and all(state.rescale_k is None and state.rescale_sigma is None for state in states)
+        and all(not state.speaker_kv_active for state in states)
+        and all(state.latents.shape[0] == 1 for state in states)
+        and all(state.context_kv_cond is not None for state in states)
+        and all(
+            state.context_kv_cfg is not None
+            for state in states
+            if state.cfg_active[state.step_index]
+        )
+    )
+
+
+@torch.inference_mode()
+def run_packed_varlen_euler_rf_cfg_step(
+    model: TextToLatentRFDiT,
+    states: list[IrodoriSamplingState],
+    *,
+    cfg_refresh: bool,
+) -> list[torch.Tensor]:
+    """Run heterogeneous requests as one exact-token varlen DiT batch."""
+    if not supports_packed_euler_rf_cfg_batch(model, states):
+        raise ValueError("Irodori states are not eligible for packed varlen execution.")
+    cfg_active = states[0].cfg_active[states[0].step_index]
+    if any(state.cfg_active[state.step_index] != cfg_active for state in states[1:]):
+        raise ValueError("Packed Irodori requests must have matching CFG activity.")
+    if cfg_active and any(
+        state.independent_names != states[0].independent_names
+        for state in states[1:]
+    ):
+        raise ValueError("Packed Irodori requests must have matching CFG layouts.")
+
+    context_mode = "cfg" if cfg_active and cfg_refresh else "cond"
+    attention_dtype = model.packed_attention_dtype
+    if attention_dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError("Packed Irodori execution has no supported attention dtype.")
+    context_kv_cache, context_lengths = _pack_batch_context(
+        states,
+        mode=context_mode,
+        attention_dtype=attention_dtype,
+    )
+    latent_chunks: list[torch.Tensor] = []
+    query_lengths: list[int] = []
+    timestep_values: list[torch.Tensor] = []
+    logical_rows_per_request: list[int] = []
+    for state in states:
+        valid_length = state.valid_latent_lengths[0]
+        logical_rows = len(state.independent_names) if cfg_active and cfg_refresh else 1
+        logical_rows_per_request.append(logical_rows)
+        valid_latent = state.latents[:, :valid_length].to(model.dtype)
+        for _ in range(logical_rows):
+            latent_chunks.append(valid_latent)
+            query_lengths.append(valid_length)
+            timestep_values.append(state.current_timestep)
+
+    if len(context_lengths) != len(query_lengths):
+        raise ValueError("Packed Irodori query and context sequence counts differ.")
+    packed_latents = torch.cat(latent_chunks, dim=1)
+    timesteps = torch.stack(timestep_values).to(
+        device=model.device,
+        dtype=model.dtype,
+    )
+    prediction = model.forward_with_packed_conditions(
+        x_t=packed_latents,
+        t=timesteps,
+        query_lengths=tuple(query_lengths),
+        context_lengths=context_lengths,
+        context_kv_cache=context_kv_cache,
+    )
+    prediction_rows = list(torch.split(prediction[0], query_lengths, dim=0))
+
+    next_latents: list[torch.Tensor] = []
+    row_offset = 0
+    for state, logical_rows in zip(states, logical_rows_per_request, strict=True):
+        valid_length = state.valid_latent_lengths[0]
+        rows = prediction_rows[row_offset : row_offset + logical_rows]
+        row_offset += logical_rows
+        conditional = rows[0]
+        if cfg_active and cfg_refresh and logical_rows > 1:
+            correction = torch.zeros_like(conditional)
+            for name, unconditional in zip(
+                state.independent_names[1:],
+                rows[1:],
+                strict=True,
+            ):
+                correction = correction + state.cfg_scales[name] * (
+                    conditional - unconditional
+                )
+            if state.cfg_correction is None:
+                state.cfg_correction = torch.zeros_like(state.latents)
+            else:
+                state.cfg_correction.zero_()
+            state.cfg_correction[:, :valid_length].copy_(correction.unsqueeze(0))
+            velocity = conditional + correction
+        elif cfg_active:
+            if state.cfg_correction is None:
+                raise ValueError("Packed Irodori CFG reuse requires a cached correction.")
+            velocity = conditional + state.cfg_correction[0, :valid_length]
+        else:
+            velocity = conditional
+
+        padded_velocity = torch.zeros_like(state.latents)
+        padded_velocity[:, :valid_length].copy_(velocity.unsqueeze(0))
+        dt = state.t_schedule[state.step_index + 1] - state.current_timestep
+        updated = state.latents + padded_velocity * dt
+        if state.latent_mask is not None:
+            updated.masked_fill_(~state.latent_mask[:, :, None], 0)
+        next_latents.append(updated)
+    return next_latents
 
 
 @torch.inference_mode()

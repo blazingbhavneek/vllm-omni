@@ -8,13 +8,24 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_varlen_func,
+)
+
 from .config import ModelConfig
+from .precision import (
+    IEEE as IEEE_MATMUL,
+    IrodoriPrecisionPolicy,
+    matmul_precision,
+    supported_attention_dtype,
+)
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES, SpeakerInversionEmbedding
 
 DURATION_SPEAKER_FUSIONS = {
@@ -101,20 +112,53 @@ class LowRankAdaLN(nn.Module):
         if self.gate_up.bias is not None:
             nn.init.zeros_(self.gate_up.bias)
 
-    def forward(
-        self, x: torch.Tensor, cond_embed: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_condition(
+        self,
+        cond_embed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         shift, scale, gate = cond_embed.chunk(3, dim=-1)
         shift = self.shift_up(self.shift_down(F.silu(shift))) + shift
         scale = self.scale_up(self.scale_down(F.silu(scale))) + scale
         gate = self.gate_up(self.gate_down(F.silu(gate))) + gate
+        return shift, scale, gate
 
+    def _apply_modulation(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
         x = x * (1.0 + scale) + shift
         gate = torch.tanh(gate)
         return x.to(x_dtype), gate
+
+    def forward(
+        self, x: torch.Tensor, cond_embed: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._apply_modulation(x, *self._project_condition(cond_embed))
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        cond_per_sequence: torch.Tensor,
+        token_sequence_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project modulation once per logical sequence, then expand results.
+
+        Expanding ``cond_per_sequence`` before the low-rank projections makes
+        every identical timestep row pay six redundant GEMMs per AdaLN.  The
+        packed path instead gathers the already-projected modulation onto the
+        physical token dimension.
+        """
+        shift, scale, gate = self._project_condition(cond_per_sequence)
+        shift = shift.index_select(0, token_sequence_indices).unsqueeze(0)
+        scale = scale.index_select(0, token_sequence_indices).unsqueeze(0)
+        gate = gate.index_select(0, token_sequence_indices).unsqueeze(0)
+        return self._apply_modulation(x, shift, scale, gate)
 
 
 def patch_sequence_with_mask(
@@ -246,14 +290,140 @@ class JointAttention(nn.Module):
             self.wv_caption = nn.Linear(int(caption_ctx_dim), dim, bias=False)
         self.gate = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
+        # Populated after checkpoint loading by ``fuse_projections``.  Keeping
+        # the source modules until then preserves the published checkpoint keys.
+        self.qkvg: nn.Linear | None = None
 
         self.q_norm = RMSNorm((self.heads, self.head_dim), eps=norm_eps)
         self.k_norm = RMSNorm((self.heads, self.head_dim), eps=norm_eps)
+        # Set by the pipeline via ``TextToLatentRFDiT.set_precision_policy``.
+        # ``None`` keeps upstream's exact SDPA behavior.  Resolved to a plain
+        # dtype so the compiled region has no untraceable hardware queries.
+        self.attention_dtype: torch.dtype | None = None
 
     def _apply_rotary_half(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         x_rot, x_passthrough = x.chunk(2, dim=-2)
         x_rot = apply_rotary_emb(x_rot, freqs_cis)
         return torch.cat([x_rot, x_passthrough], dim=-2)
+
+    def fuse_projections(self) -> bool:
+        """Fuse Q/K/V/gate weights into one inference GEMM after loading."""
+        if self.qkvg is not None:
+            return False
+        source_modules = (self.wq, self.wk, self.wv, self.gate)
+        if any(module is None for module in source_modules):
+            raise RuntimeError("JointAttention projection fusion source is incomplete.")
+        fused = nn.Linear(
+            self.dim,
+            self.dim * len(source_modules),
+            bias=False,
+            device=self.wq.weight.device,
+            dtype=self.wq.weight.dtype,
+        )
+        with torch.no_grad():
+            for index, module in enumerate(source_modules):
+                assert module is not None
+                start = index * self.dim
+                fused.weight[start : start + self.dim].copy_(module.weight)
+        self.qkvg = fused
+        self.wq = None
+        self.wk = None
+        self.wv = None
+        self.gate = None
+        return True
+
+    def _project_self(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, seq_len, _ = x.shape
+        if self.qkvg is not None:
+            q, k, v, gate = self.qkvg(x).chunk(4, dim=-1)
+        else:
+            if self.wq is None or self.wk is None or self.wv is None or self.gate is None:
+                raise RuntimeError("JointAttention projections are unavailable.")
+            q = self.wq(x)
+            k = self.wk(x)
+            v = self.wv(x)
+            gate = self.gate(x)
+        return (
+            q.reshape(bsz, seq_len, self.heads, self.head_dim),
+            k.reshape(bsz, seq_len, self.heads, self.head_dim),
+            v.reshape(bsz, seq_len, self.heads, self.head_dim),
+            gate,
+        )
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        context_kv: tuple[torch.Tensor, torch.Tensor],
+        self_kv_indices: torch.Tensor,
+        context_kv_indices: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Joint attention over already-packed variable-length requests.
+
+        Linear projections operate on one contiguous valid-token dimension.
+        K/V are then interleaved into per-request ``[latent, context]``
+        documents and isolated by FlashAttention's cumulative sequence
+        boundaries.  No latent or context padding participates in the DiT.
+        """
+        if flash_attn_varlen_func is None:
+            raise RuntimeError(
+                "Packed Irodori attention requires a varlen FlashAttention kernel."
+            )
+        if x.shape[0] != 1:
+            raise ValueError("Packed Irodori attention expects physical batch size 1.")
+
+        _, packed_len, _ = x.shape
+        q, k_self, v_self, gate = self._project_self(x)
+        q = self.q_norm(q)
+        k_self = self.k_norm(k_self)
+        q = self._apply_rotary_half(q, freqs_cis)
+        k_self = self._apply_rotary_half(k_self, freqs_cis)
+
+        output_dtype = q.dtype
+        attention_dtype = self.attention_dtype
+        if attention_dtype is None:
+            raise RuntimeError(
+                "Packed Irodori attention requires a BF16/FP16 attention policy."
+            )
+        q = q.to(attention_dtype)
+        k_self = k_self.to(attention_dtype)
+        v_self = v_self.to(attention_dtype)
+        context_k, context_v = context_kv
+        if context_k.dtype != attention_dtype or context_v.dtype != attention_dtype:
+            raise ValueError("Packed Irodori context K/V must use the attention dtype.")
+        # Preserve this as a SymInt under regional torch.compile so changing
+        # packed token totals does not force scalar extraction/graph breaks.
+        total_kv = self_kv_indices.shape[0] + context_kv_indices.shape[0]
+        key = k_self.new_empty((1, total_kv, self.heads, self.head_dim))
+        value = v_self.new_empty((1, total_kv, self.heads, self.head_dim))
+        key.index_copy_(1, self_kv_indices, k_self)
+        value.index_copy_(1, self_kv_indices, v_self)
+        key.index_copy_(1, context_kv_indices, context_k)
+        value.index_copy_(1, context_kv_indices, context_v)
+
+        y = flash_attn_varlen_func(
+            q=q.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=False,
+            softmax_scale=self.head_dim**-0.5,
+        )
+        if isinstance(y, tuple):
+            y = y[0]
+        y = y.reshape(1, packed_len, self.dim).to(output_dtype)
+        y = y * torch.sigmoid(gate)
+        return self.wo(y)
 
     def project_context_kv(
         self,
@@ -329,9 +499,7 @@ class JointAttention(nn.Module):
         context_kv: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
-        q = self.wq(x).reshape(bsz, seq_len, self.heads, self.head_dim)
-        k_self = self.wk(x).reshape(bsz, seq_len, self.heads, self.head_dim)
-        v_self = self.wv(x).reshape(bsz, seq_len, self.heads, self.head_dim)
+        q, k_self, v_self, gate = self._project_self(x)
         if context_kv is None:
             projected = self.project_context_kv(
                 text_context=text_context,
@@ -409,15 +577,31 @@ class JointAttention(nn.Module):
         attn_mask = torch.cat(context_masks, dim=1)
         attn_mask = attn_mask[:, None, None, :]
 
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        # FP32 SDPA has no FlashAttention kernel and ignores TF32, so this is
+        # the only way to move joint attention onto tensor cores.  Q/K/V are
+        # already RMS-normed and softmax renormalizes, so the reduced mantissa
+        # stays confined to this call; the output is restored immediately.
+        attention_dtype = self.attention_dtype if q_t.dtype is torch.float32 else None
+        if attention_dtype is not None:
+            output_dtype = q_t.dtype
+            q_t = q_t.to(attention_dtype)
+            k_t = k_t.to(attention_dtype)
+            v_t = v_t.to(attention_dtype)
         y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
+            q_t,
+            k_t,
+            v_t,
             attn_mask=attn_mask,
             is_causal=False,
-        ).transpose(1, 2)
+        )
+        if attention_dtype is not None:
+            y = y.to(output_dtype)
+        y = y.transpose(1, 2)
         y = y.reshape(bsz, seq_len, self.dim)
-        y = y * torch.sigmoid(self.gate(x))
+        y = y * torch.sigmoid(gate)
         return self.wo(y)
 
 
@@ -427,9 +611,41 @@ class SwiGLU(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        # Populated after checkpoint loading. Source names stay intact while
+        # AutoWeightsLoader consumes the upstream checkpoint.
+        self.w13: nn.Linear | None = None
+
+    def fuse_projections(self) -> bool:
+        """Fuse the two same-input SwiGLU projections into one GEMM."""
+        if self.w13 is not None:
+            return False
+        if self.w1 is None or self.w3 is None:
+            raise RuntimeError("SwiGLU projection fusion source is incomplete.")
+        hidden_dim = self.w1.out_features
+        fused = nn.Linear(
+            self.w1.in_features,
+            hidden_dim * 2,
+            bias=False,
+            device=self.w1.weight.device,
+            dtype=self.w1.weight.dtype,
+        )
+        with torch.no_grad():
+            fused.weight[:hidden_dim].copy_(self.w1.weight)
+            fused.weight[hidden_dim:].copy_(self.w3.weight)
+        self.w13 = fused
+        self.w1 = None
+        self.w3 = None
+        return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        if self.w13 is not None:
+            w1, w3 = self.w13(x).chunk(2, dim=-1)
+        else:
+            if self.w1 is None or self.w3 is None:
+                raise RuntimeError("SwiGLU input projections are unavailable.")
+            w1 = self.w1(x)
+            w3 = self.w3(x)
+        return self.w2(F.silu(w1) * w3)
 
 
 def _safe_attention_mask(
@@ -965,7 +1181,45 @@ class DiffusionBlock(nn.Module):
         freqs_cis: torch.Tensor,
         self_mask: torch.Tensor | None = None,
         context_kv: tuple[torch.Tensor, ...] | None = None,
+        packed_context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        self_kv_indices: torch.Tensor | None = None,
+        context_kv_indices: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        token_sequence_indices: torch.Tensor | None = None,
+        max_seqlen_q: int = 0,
+        max_seqlen_k: int = 0,
     ) -> torch.Tensor:
+        if packed_context_kv is not None:
+            if any(
+                value is None
+                for value in (
+                    self_kv_indices,
+                    context_kv_indices,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    token_sequence_indices,
+                )
+            ):
+                raise ValueError("Packed Irodori block metadata is incomplete.")
+            assert self_kv_indices is not None
+            assert context_kv_indices is not None
+            assert cu_seqlens_q is not None
+            assert cu_seqlens_k is not None
+            assert token_sequence_indices is not None
+            return self.forward_packed(
+                x=x,
+                cond_embed=cond_embed,
+                freqs_cis=freqs_cis,
+                context_kv=packed_context_kv,
+                self_kv_indices=self_kv_indices,
+                context_kv_indices=context_kv_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                token_sequence_indices=token_sequence_indices,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
         h, attention_gate = self.attention_adaln(x, cond_embed)
         x = x + self.dropout(
             attention_gate
@@ -986,6 +1240,46 @@ class DiffusionBlock(nn.Module):
         h, mlp_gate = self.mlp_adaln(x, cond_embed)
         x = x + self.dropout(mlp_gate * self.mlp(h))
         return x
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        cond_embed: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        context_kv: tuple[torch.Tensor, torch.Tensor],
+        self_kv_indices: torch.Tensor,
+        context_kv_indices: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        token_sequence_indices: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        h, attention_gate = self.attention_adaln.forward_packed(
+            x,
+            cond_embed,
+            token_sequence_indices,
+        )
+        x = x + self.dropout(
+            attention_gate
+            * self.attention.forward_packed(
+                x=h,
+                freqs_cis=freqs_cis,
+                context_kv=context_kv,
+                self_kv_indices=self_kv_indices,
+                context_kv_indices=context_kv_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
+        )
+        h, mlp_gate = self.mlp_adaln.forward_packed(
+            x,
+            cond_embed,
+            token_sequence_indices,
+        )
+        return x + self.dropout(mlp_gate * self.mlp(h))
 
 
 class DurationPredictor(nn.Module):
@@ -1461,6 +1755,10 @@ class TextToLatentRFDiT(nn.Module):
     Output v_pred shape: same as input.
     """
 
+    # ``DiffusionModelRunner`` applies regional torch.compile to every module
+    # class named here, compiling one block and reusing it for all 12 layers.
+    _repeated_blocks = ["DiffusionBlock"]
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -1723,7 +2021,75 @@ class TextToLatentRFDiT(nn.Module):
         speaker_mask[dropout_mask] = False
         return speaker_state, speaker_mask
 
-    def encode_conditions(
+    def set_precision_policy(self, policy: IrodoriPrecisionPolicy | None) -> None:
+        """Install a per-stage precision policy on this model and its blocks."""
+        self.precision_policy = policy
+        attention_dtype = supported_attention_dtype(policy)
+        self.packed_attention_dtype = attention_dtype
+        for module in self.modules():
+            if isinstance(module, JointAttention):
+                module.attention_dtype = attention_dtype
+
+    def fuse_linear_projections_for_inference(self) -> tuple[int, int]:
+        """Fuse same-input DiT projections after checkpoint loading.
+
+        The checkpoint and LoRA ecosystem address the original individual
+        modules, so this transformation deliberately happens only after the
+        base weights have loaded. It is idempotent and runs before regional
+        compilation.
+        """
+        attention_count = 0
+        swiglu_count = 0
+        for block in self.blocks:
+            attention_count += int(block.attention.fuse_projections())
+            swiglu_count += int(block.mlp.fuse_projections())
+        return attention_count, swiglu_count
+
+    def supports_packed_varlen_attention(self) -> bool:
+        """Whether this worker can safely execute isolated packed requests."""
+        attention_dtype = getattr(self, "packed_attention_dtype", None)
+        return (
+            self.device.type == "cuda"
+            and attention_dtype in (torch.bfloat16, torch.float16)
+            and flash_attn_varlen_func is not None
+        )
+
+    def _stage_matmul_mode(self, stage: str) -> str:
+        policy = getattr(self, "precision_policy", None)
+        if policy is None:
+            return IEEE_MATMUL
+        return getattr(policy, f"{stage}_matmul")
+
+    def encode_conditions(self, *args: Any, **kwargs: Any) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Encode text/speaker/caption conditions under the condition policy.
+
+        Kept at IEEE FP32 by default: these outputs feed the duration
+        predictor's integer rounding, where a small perturbation becomes a
+        discrete change in output length.
+        """
+        with matmul_precision(self._stage_matmul_mode("condition")):
+            return self._encode_conditions(*args, **kwargs)
+
+    def predict_duration_log_frames(self, **kwargs: Any) -> torch.Tensor:
+        with matmul_precision(self._stage_matmul_mode("condition")):
+            return self._predict_duration_log_frames(**kwargs)
+
+    def forward_with_encoded_conditions(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        with matmul_precision(self._stage_matmul_mode("dit")):
+            return self._forward_with_encoded_conditions(*args, **kwargs)
+
+    def forward_with_packed_conditions(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        with matmul_precision(self._stage_matmul_mode("dit")):
+            return self._forward_with_packed_conditions(*args, **kwargs)
+
+    def _encode_conditions(
         self,
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor,
@@ -1832,7 +2198,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_state = self.caption_norm(caption_state)
         return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask
 
-    def forward_with_encoded_conditions(
+    def _forward_with_encoded_conditions(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
@@ -1886,6 +2252,128 @@ class TextToLatentRFDiT(nn.Module):
 
         x = self.out_norm(x)
         x = self.out_proj(x)
+        return x.to(dtype=x_t.dtype)
+
+    def _forward_with_packed_conditions(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        query_lengths: tuple[int, ...],
+        context_lengths: tuple[int, ...],
+        context_kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Run the DiT over packed valid tokens from heterogeneous requests."""
+        if not self.supports_packed_varlen_attention():
+            raise RuntimeError(
+                "Packed Irodori execution requires CUDA BF16/FP16 varlen FlashAttention."
+            )
+        if x_t.ndim != 3 or x_t.shape[0] != 1:
+            raise ValueError(
+                f"Packed Irodori x_t must have shape (1, tokens, dim), got {tuple(x_t.shape)}."
+            )
+        if not query_lengths or len(query_lengths) != len(context_lengths):
+            raise ValueError("Packed Irodori query/context layouts must be non-empty and aligned.")
+        if t.ndim != 1 or t.shape[0] != len(query_lengths):
+            raise ValueError("Packed Irodori timesteps must contain one value per logical sequence.")
+        if sum(query_lengths) != x_t.shape[1]:
+            raise ValueError("Packed Irodori query lengths do not cover x_t.")
+        if len(context_kv_cache) != len(self.blocks):
+            raise ValueError("Packed Irodori context K/V layer count does not match the DiT.")
+
+        device = x_t.device
+        query_lengths_tensor = torch.tensor(
+            query_lengths,
+            dtype=torch.long,
+            device=device,
+        )
+        t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
+        cond_embed = self.cond_module(t_embed)
+        token_sequence_indices = torch.repeat_interleave(
+            torch.arange(len(query_lengths), dtype=torch.long, device=device),
+            query_lengths_tensor,
+        )
+
+        query_offsets = [0]
+        key_offsets = [0]
+        self_positions: list[torch.Tensor] = []
+        context_positions: list[torch.Tensor] = []
+        position_ids: list[torch.Tensor] = []
+        for query_length, context_length in zip(
+            query_lengths,
+            context_lengths,
+            strict=True,
+        ):
+            query_start = query_offsets[-1]
+            key_start = key_offsets[-1]
+            query_offsets.append(query_start + query_length)
+            key_offsets.append(key_start + query_length + context_length)
+            self_positions.append(
+                torch.arange(
+                    key_start,
+                    key_start + query_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+            context_positions.append(
+                torch.arange(
+                    key_start + query_length,
+                    key_start + query_length + context_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+            position_ids.append(
+                torch.arange(query_length, dtype=torch.long, device=device)
+            )
+
+        self_kv_indices = torch.cat(self_positions)
+        context_kv_indices = torch.cat(context_positions)
+        cu_seqlens_q = torch.tensor(query_offsets, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(key_offsets, dtype=torch.int32, device=device)
+        packed_position_ids = torch.cat(position_ids)
+        freqs = self._rope_freqs(max(query_lengths), device)[packed_position_ids]
+
+        x = self.in_proj(x_t)
+        max_seqlen_q = max(query_lengths)
+        max_seqlen_k = max(
+            query_length + context_length
+            for query_length, context_length in zip(
+                query_lengths,
+                context_lengths,
+                strict=True,
+            )
+        )
+        for block, context_kv in zip(
+            self.blocks,
+            context_kv_cache,
+            strict=True,
+        ):
+            if context_kv[0].shape[1] != sum(context_lengths):
+                raise ValueError("Packed Irodori context lengths do not cover the K/V cache.")
+            x = block(
+                x=x,
+                cond_embed=cond_embed,
+                # The packed branch does not read dense condition tensors;
+                # pass existing tensors to preserve one compiled entrypoint.
+                text_state=context_kv[0],
+                text_mask=cu_seqlens_q,
+                speaker_state=None,
+                speaker_mask=None,
+                caption_state=None,
+                caption_mask=None,
+                freqs_cis=freqs,
+                packed_context_kv=context_kv,
+                self_kv_indices=self_kv_indices,
+                context_kv_indices=context_kv_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                token_sequence_indices=token_sequence_indices,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
+
+        x = self.out_proj(self.out_norm(x))
         return x.to(dtype=x_t.dtype)
 
     def forward(
@@ -2048,7 +2536,7 @@ class TextToLatentRFDiT(nn.Module):
         denom = mask_f.sum(dim=1).clamp_min(1.0)
         return (state * mask_f).sum(dim=1) / denom
 
-    def predict_duration_log_frames(
+    def _predict_duration_log_frames(
         self,
         *,
         text_state: torch.Tensor,

@@ -123,6 +123,17 @@ def supports_step_execution_partition(pipeline: object) -> bool:
 
 
 @runtime_checkable
+class SupportsRaggedStepExecution(Protocol):
+    """Optional protocol for pipelines whose request latents may differ in shape."""
+
+    supports_ragged_step_execution: ClassVar[bool] = True
+
+
+def supports_ragged_step_execution(pipeline: object) -> bool:
+    return isinstance(pipeline, SupportsRaggedStepExecution)
+
+
+@runtime_checkable
 class SupportsFusedStepExecution(Protocol):
     """Optional protocol for pipelines that apply denoise and update together."""
 

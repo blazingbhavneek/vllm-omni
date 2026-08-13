@@ -48,6 +48,7 @@ from vllm_omni.diffusion.models.interface import (
     is_request_scoped_cache_dit_enabled,
     supports_fused_step_execution,
     supports_prompt_update,
+    supports_ragged_step_execution,
     supports_step_execution,
     supports_step_execution_partition,
 )
@@ -979,6 +980,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         input_batch = InputBatch.make_batch(
             states,
             cached_batch=input_batches.get(execution_key),
+            allow_ragged_latents=supports_ragged_step_execution(self.pipeline),
         )
         input_batches[execution_key] = input_batch
         self.input_batch = input_batch
@@ -994,19 +996,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> None:
         """Step-after update: clear cached state for completed request."""
         failed_request_ids = failed_request_ids or set()
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
-        else:
-            input_batch.latents = gathered_latents.clone()
+        if not supports_ragged_step_execution(self.pipeline):
+            gathered_latents = torch.cat([state.latents for state in states], dim=0)
+            if (
+                input_batch.latents.size() == gathered_latents.size()
+                and input_batch.latents.dtype == gathered_latents.dtype
+                and input_batch.latents.device == gathered_latents.device
+            ):
+                input_batch.latents.copy_(gathered_latents)
+            else:
+                input_batch.latents = gathered_latents.clone()
+
+            scatter_latents(states, input_batch)
 
         self.input_batches[execution_key] = input_batch
         self.input_batch = input_batch
-        scatter_latents(states, input_batch)
 
         for state in states:
             if (

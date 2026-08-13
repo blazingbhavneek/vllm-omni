@@ -210,6 +210,7 @@ def main() -> None:
         model_class_name="IrodoriTTSPipeline",
         dtype=dtype,
         max_num_seqs=args.max_num_seqs,
+        diffusion_batch_size=args.max_num_seqs,
         step_execution=args.step_execution,
         enforce_eager=args.enforce_eager,
     )

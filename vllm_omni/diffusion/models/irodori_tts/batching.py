@@ -12,14 +12,22 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .precision import (
+    IrodoriPrecisionPolicy,
+    TRAINED_POLICY,
+    resolve_precision_policy,
+)
+
 if TYPE_CHECKING:
     from .sampler import ConditionBundle, ContextKVCache, IrodoriSamplingState
 
 
-DEFAULT_LATENT_BUCKET_SECONDS = (2.0, 4.0, 8.0, 16.0, 32.0)
+DEFAULT_LATENT_BUCKET_SECONDS = tuple(float(seconds) for seconds in range(2, 31, 2))
 DEFAULT_CONTEXT_BUCKET_TOKENS = (8, 16, 32, 64, 128, 256, 512, 1024)
 DEFAULT_CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
 IRODORI_CUDA_GRAPH_ENV = "VLLM_OMNI_IRODORI_CUDA_GRAPH"
+IRODORI_PRECISION_ENV = "VLLM_OMNI_IRODORI_PRECISION"
+IRODORI_FUSED_PROJECTIONS_ENV = "VLLM_OMNI_IRODORI_FUSED_PROJECTIONS"
 
 
 def _environment_bool(name: str, *, default: bool) -> bool:
@@ -91,7 +99,9 @@ class IrodoriLengthState:
 class IrodoriExecutionKey:
     """Worker-side key for one physically homogeneous denoise microbatch."""
 
-    bucket_latent_len: int
+    # ``None`` selects packed variable-length execution.  A concrete bucket
+    # keeps the padded fallback isolated by physical latent shape.
+    bucket_latent_len: int | None
     dtype: torch.dtype
     device_type: str
     device_index: int | None
@@ -130,6 +140,8 @@ class IrodoriBatchingConfig:
     cuda_graph_min_hits: int
     enable_cuda_graph: bool
     cfg_refresh_interval: int
+    precision_policy: IrodoriPrecisionPolicy
+    fuse_linear_projections: bool
 
     @classmethod
     def from_od_config(cls, od_config: Any) -> IrodoriBatchingConfig:
@@ -171,6 +183,16 @@ class IrodoriBatchingConfig:
         if not isinstance(enable_graph, bool):
             raise ValueError("irodori_enable_cuda_graph must be a boolean.")
 
+        if "irodori_fuse_linear_projections" in extras:
+            fuse_linear_projections = extras["irodori_fuse_linear_projections"]
+            if not isinstance(fuse_linear_projections, bool):
+                raise ValueError("irodori_fuse_linear_projections must be a boolean.")
+        else:
+            fuse_linear_projections = _environment_bool(
+                IRODORI_FUSED_PROJECTIONS_ENV,
+                default=True,
+            )
+
         return cls(
             latent_bucket_seconds=latent_seconds,
             overflow_bucket_seconds=_positive_float(
@@ -193,6 +215,16 @@ class IrodoriBatchingConfig:
                 name="irodori_cuda_graph_min_hits",
             ),
             enable_cuda_graph=enable_graph,
+            # Stage ``extras`` is the request/config-level knob.  Keep the
+            # environment fallback for process-wide deployments and give it
+            # lower precedence than an explicit stage setting.
+            precision_policy=resolve_precision_policy(
+                extras.get(
+                    "irodori_precision_profile",
+                    os.environ.get(IRODORI_PRECISION_ENV, TRAINED_POLICY.name),
+                )
+            ),
+            fuse_linear_projections=fuse_linear_projections,
             # 1 recomputes every CFG branch on every step, matching the
             # reference sampler exactly.  Higher values reuse the last
             # correction in between and trade fidelity for speed.

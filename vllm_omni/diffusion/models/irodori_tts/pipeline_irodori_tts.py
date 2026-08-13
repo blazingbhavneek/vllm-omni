@@ -13,6 +13,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -47,10 +48,14 @@ from .sampler import (
     predict_euler_rf_cfg_batch,
     predict_euler_rf_cfg_step,
     prepare_euler_rf_cfg,
+    run_packed_varlen_euler_rf_cfg_step,
     run_packed_euler_rf_cfg_step,
+    supports_packed_euler_rf_cfg_batch,
 )
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
+
+logger = init_logger(__name__)
 
 
 def get_irodori_tts_post_process_func(_od_config: OmniDiffusionConfig):
@@ -169,6 +174,7 @@ class IrodoriTTSPipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_step_execution_partition: ClassVar[bool] = True
     supports_fused_step_execution: ClassVar[bool] = True
+    supports_ragged_step_execution: ClassVar[bool] = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 48000
     _dit_modules: ClassVar[list[str]] = ["model"]
@@ -219,6 +225,25 @@ class IrodoriTTSPipeline(
                 f"Irodori requires {self.audio_sample_rate} Hz DACVAE output; got {self.codec.sample_rate}."
             )
         self.batching_config = IrodoriBatchingConfig.from_od_config(od_config)
+        # Per-stage precision policy: TF32 for the DiT/codec matmuls, BF16 for
+        # joint attention, strict IEEE FP32 for the condition encoders and the
+        # duration predictor.  See precision.py for why the split exists.
+        self.precision_policy = self.batching_config.precision_policy
+        self.model.set_precision_policy(self.precision_policy)
+        self.codec.precision_policy = self.precision_policy
+        self.packed_varlen_enabled = self.model.supports_packed_varlen_attention()
+        logger.info(
+            "Irodori precision profile %r: dit=%s codec=%s condition=%s attention=%s",
+            self.precision_policy.name,
+            self.precision_policy.dit_matmul,
+            self.precision_policy.codec_matmul,
+            self.precision_policy.condition_matmul,
+            self.precision_policy.attention_dtype,
+        )
+        logger.info(
+            "Irodori packed varlen DiT batching: %s",
+            "enabled" if self.packed_varlen_enabled else "unavailable; using latent buckets",
+        )
         self.latent_bucket_policy = IrodoriLatentBucketPolicy(
             sample_rate=self.codec.sample_rate,
             hop_length=self.codec.hop_length,
@@ -233,8 +258,8 @@ class IrodoriTTSPipeline(
             getattr(od_config, "enforce_eager", False)
         )
         # Keep manual graph capture separate from real torch.compile output.
-        # Regional compile is currently a no-op for Irodori because the model
-        # deliberately has no `_repeated_blocks` declaration.
+        # Irodori's repeated DiT blocks use regional compilation, so the
+        # low-value manual graph path is disabled when that compile is active.
         compile_granularity = getattr(
             od_config,
             "diffusion_compile_granularity",
@@ -291,7 +316,27 @@ class IrodoriTTSPipeline(
         return PretrainedTextTokenizer(tokenizer, add_bos=self.checkpoint_config.model.text_add_bos)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
+        if self.batching_config.fuse_linear_projections:
+            if getattr(self.od_config, "quantization_config", None) is not None:
+                logger.warning(
+                    "Irodori linear projection fusion is disabled for quantized weights."
+                )
+            elif getattr(self.od_config, "lora_path", None):
+                logger.warning(
+                    "Irodori linear projection fusion is disabled for the configured LoRA; "
+                    "the adapter targets the original projection module names."
+                )
+            else:
+                attention_count, swiglu_count = (
+                    self.model.fuse_linear_projections_for_inference()
+                )
+                logger.info(
+                    "Irodori fused same-input projections in %d attention and %d SwiGLU modules.",
+                    attention_count,
+                    swiglu_count,
+                )
+        return loaded
 
     @staticmethod
     def _positive_int(value: Any, *, name: str, minimum: int, maximum: int) -> int:
@@ -584,7 +629,11 @@ class IrodoriTTSPipeline(
         cfg_active = sampling_state.cfg_active[sampling_state.step_index]
         device = sampling_state.latents.device
         return IrodoriExecutionKey(
-            bucket_latent_len=prepared.lengths.bucket_latent_len,
+            bucket_latent_len=(
+                None
+                if supports_packed_euler_rf_cfg_batch(self.model, [sampling_state])
+                else prepared.lengths.bucket_latent_len
+            ),
             dtype=sampling_state.latents.dtype,
             device_type=device.type,
             device_index=device.index,
@@ -689,6 +738,27 @@ class IrodoriTTSPipeline(
             ):
                 apply_euler_rf_cfg_step(sampling_state, prediction)
                 state.latents = sampling_state.latents
+                state.step_index += 1
+            return
+
+        if supports_packed_euler_rf_cfg_batch(self.model, sampling_states):
+            execution_key = self.get_step_execution_key(states[0])
+            if any(self.get_step_execution_key(state) != execution_key for state in states[1:]):
+                raise ValueError("Irodori packed step received a heterogeneous execution group.")
+            next_latents = run_packed_varlen_euler_rf_cfg_step(
+                self.model,
+                sampling_states,
+                cfg_refresh=execution_key.cfg_refresh,
+            )
+            for state, sampling_state, request_latents in zip(
+                states,
+                sampling_states,
+                next_latents,
+                strict=True,
+            ):
+                sampling_state.latents = request_latents
+                sampling_state.step_index += 1
+                state.latents = request_latents
                 state.step_index += 1
             return
 
