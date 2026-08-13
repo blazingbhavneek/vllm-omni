@@ -43,13 +43,16 @@ from .model import TextToLatentRFDiT
 from .sampler import (
     IrodoriConditionState,
     IrodoriSamplingState,
+    PackedContextState,
     apply_euler_rf_cfg_step,
     encode_irodori_conditions,
+    pack_irodori_batch_context,
+    packed_context_modes,
     predict_euler_rf_cfg_batch,
     predict_euler_rf_cfg_step,
     prepare_euler_rf_cfg,
-    run_packed_varlen_euler_rf_cfg_step,
     run_packed_euler_rf_cfg_step,
+    run_packed_varlen_euler_rf_cfg_step,
     supports_packed_euler_rf_cfg_batch,
 )
 from .text_normalization import normalize_text
@@ -251,12 +254,8 @@ class IrodoriTTSPipeline(
             bucket_seconds=self.batching_config.latent_bucket_seconds,
             overflow_bucket_seconds=self.batching_config.overflow_bucket_seconds,
         )
-        self.context_bucket_policy = IrodoriContextBucketPolicy(
-            self.batching_config.context_bucket_tokens
-        )
-        graph_enabled = self.batching_config.enable_cuda_graph and not bool(
-            getattr(od_config, "enforce_eager", False)
-        )
+        self.context_bucket_policy = IrodoriContextBucketPolicy(self.batching_config.context_bucket_tokens)
+        graph_enabled = self.batching_config.enable_cuda_graph and not bool(getattr(od_config, "enforce_eager", False))
         # Keep manual graph capture separate from real torch.compile output.
         # Irodori's repeated DiT blocks use regional compilation, so the
         # low-value manual graph path is disabled when that compile is active.
@@ -275,9 +274,11 @@ class IrodoriTTSPipeline(
             max_dynamic_entries=self.batching_config.cuda_graph_max_dynamic_entries,
             min_hits=self.batching_config.cuda_graph_min_hits,
         )
-        self._denoise_batches: OrderedDict[IrodoriExecutionKey, IrodoriDenoiseBatch] = (
-            OrderedDict()
-        )
+        self._denoise_batches: OrderedDict[IrodoriExecutionKey, IrodoriDenoiseBatch] = OrderedDict()
+        self._packed_context_batches: OrderedDict[
+            tuple[Any, ...],
+            PackedContextState,
+        ] = OrderedDict()
         weight_source = od_config.model
         if os.path.isfile(weight_source):
             weight_source = os.path.dirname(checkpoint_path)
@@ -319,18 +320,14 @@ class IrodoriTTSPipeline(
         loaded = AutoWeightsLoader(self).load_weights(weights)
         if self.batching_config.fuse_linear_projections:
             if getattr(self.od_config, "quantization_config", None) is not None:
-                logger.warning(
-                    "Irodori linear projection fusion is disabled for quantized weights."
-                )
+                logger.warning("Irodori linear projection fusion is disabled for quantized weights.")
             elif getattr(self.od_config, "lora_path", None):
                 logger.warning(
                     "Irodori linear projection fusion is disabled for the configured LoRA; "
                     "the adapter targets the original projection module names."
                 )
             else:
-                attention_count, swiglu_count = (
-                    self.model.fuse_linear_projections_for_inference()
-                )
+                attention_count, swiglu_count = self.model.fuse_linear_projections_for_inference()
                 logger.info(
                     "Irodori fused same-input projections in %d attention and %d SwiGLU modules.",
                     attention_count,
@@ -507,15 +504,14 @@ class IrodoriTTSPipeline(
             speaker_mask=condition.speaker_mask,
             caption_state=condition.caption_state,
             caption_mask=condition.caption_mask,
-            duration_features=features, has_speaker=torch.tensor([has_reference], device=self.device),
+            duration_features=features,
+            has_speaker=torch.tensor([has_reference], device=self.device),
             has_caption=torch.tensor(
                 [condition.caption_mask is not None and bool(condition.caption_mask.any().item())],
                 device=self.device,
             ),
         )
-        valid_codec_frames = round(
-            float(torch.expm1(prediction).mean().item()) * options["duration_scale"]
-        )
+        valid_codec_frames = round(float(torch.expm1(prediction).mean().item()) * options["duration_scale"])
         minimum = math.ceil(0.5 * self.codec.sample_rate / self.codec.hop_length)
         maximum = math.ceil(30.0 * self.codec.sample_rate / self.codec.hop_length)
         valid_codec_frames = min(max(valid_codec_frames, minimum), maximum)
@@ -628,21 +624,31 @@ class IrodoriTTSPipeline(
         sampling_state = prepared.sampling_state
         cfg_active = sampling_state.cfg_active[sampling_state.step_index]
         device = sampling_state.latents.device
+        packed_varlen = supports_packed_euler_rf_cfg_batch(
+            self.model,
+            [sampling_state],
+        )
         return IrodoriExecutionKey(
-            bucket_latent_len=(
-                None
-                if supports_packed_euler_rf_cfg_batch(self.model, [sampling_state])
-                else prepared.lengths.bucket_latent_len
-            ),
+            bucket_latent_len=(None if packed_varlen else prepared.lengths.bucket_latent_len),
             dtype=sampling_state.latents.dtype,
             device_type=device.type,
             device_index=device.index,
             cfg_guidance_mode=sampling_state.cfg_guidance_mode,
-            cfg_layout=sampling_state.independent_names if cfg_active else ("cond",),
-            cfg_refresh=self._needs_cfg_refresh(
-                sampling_state,
-                cfg_active,
-                prepared.cfg_refresh_interval,
+            # FA4 varlen carries request-local sequence counts, so active CFG,
+            # inactive CFG, and correction-reuse requests can share one
+            # physical forward.  The padded fallback still needs homogeneous
+            # rows and therefore retains the original phase-specific key.
+            cfg_layout=(
+                ("packed-varlen",) if packed_varlen else sampling_state.independent_names if cfg_active else ("cond",)
+            ),
+            cfg_refresh=(
+                True
+                if packed_varlen
+                else self._needs_cfg_refresh(
+                    sampling_state,
+                    cfg_active,
+                    prepared.cfg_refresh_interval,
+                )
             ),
         )
 
@@ -654,9 +660,8 @@ class IrodoriTTSPipeline(
     ) -> bool:
         """Whether this step must recompute the unconditional CFG branches.
 
-        Refreshing and reusing requests cannot share a physical forward, so
-        this feeds the execution key and splits them into separate
-        microbatches.
+        Packed varlen execution can mix this choice per request. The padded
+        fallback still feeds it into the execution key and partitions rows.
         """
         if not cfg_active:
             return True
@@ -686,9 +691,7 @@ class IrodoriTTSPipeline(
                 raise ValueError(f"Missing Irodori step state for request {state.request_id}.")
             if state.step_index != prepared.sampling_state.step_index:
                 raise ValueError(f"Irodori step index diverged for request {state.request_id}.")
-            grouped.setdefault(self.get_step_execution_key(state), []).append(
-                (state, prepared)
-            )
+            grouped.setdefault(self.get_step_execution_key(state), []).append((state, prepared))
 
         predictions: dict[str, torch.Tensor] = {}
         for group in grouped.values():
@@ -745,10 +748,28 @@ class IrodoriTTSPipeline(
             execution_key = self.get_step_execution_key(states[0])
             if any(self.get_step_execution_key(state) != execution_key for state in states[1:]):
                 raise ValueError("Irodori packed step received a heterogeneous execution group.")
+            cfg_refreshes = [
+                self._needs_cfg_refresh(
+                    sampling_state,
+                    sampling_state.cfg_active[sampling_state.step_index],
+                    prepared.cfg_refresh_interval,
+                )
+                for sampling_state, prepared in zip(
+                    sampling_states,
+                    prepared_requests,
+                    strict=True,
+                )
+            ]
+            packed_context = self._get_packed_batch_context(
+                states,
+                sampling_states,
+                cfg_refreshes,
+            )
             next_latents = run_packed_varlen_euler_rf_cfg_step(
                 self.model,
                 sampling_states,
-                cfg_refresh=execution_key.cfg_refresh,
+                cfg_refreshes=cfg_refreshes,
+                packed_context=packed_context,
             )
             for state, sampling_state, request_latents in zip(
                 states,
@@ -770,9 +791,7 @@ class IrodoriTTSPipeline(
             [state.request_id for state in states],
             sampling_states,
             context_policy=self.context_bucket_policy,
-            is_dynamic_latent_bucket=any(
-                prepared.lengths.is_dynamic_bucket for prepared in prepared_requests
-            ),
+            is_dynamic_latent_bucket=any(prepared.lengths.is_dynamic_bucket for prepared in prepared_requests),
             cached_batch=cached_batch,
             cfg_refresh=execution_key.cfg_refresh,
         )
@@ -787,12 +806,8 @@ class IrodoriTTSPipeline(
             denoise_batch,
             run_packed_euler_rf_cfg_step,
         )
-        refreshed_correction = (
-            denoise_batch.cfg_correction if execution_key.cfg_refresh else None
-        )
-        for index, (state, sampling_state) in enumerate(
-            zip(states, sampling_states, strict=True)
-        ):
+        refreshed_correction = denoise_batch.cfg_correction if execution_key.cfg_refresh else None
+        for index, (state, sampling_state) in enumerate(zip(states, sampling_states, strict=True)):
             # Graph outputs are shared fixed buffers, so each request owns a copy.
             request_latents = next_latents[index : index + 1].clone()
             sampling_state.latents = request_latents
@@ -802,9 +817,50 @@ class IrodoriTTSPipeline(
             state.latents = request_latents
             state.step_index += 1
 
+    def _get_packed_batch_context(
+        self,
+        states: list[StepRequestState],
+        sampling_states: list[IrodoriSamplingState],
+        cfg_refreshes: list[bool],
+    ) -> PackedContextState:
+        """Reuse cross-request static K/V concatenations across denoise steps."""
+        context_modes = packed_context_modes(sampling_states, cfg_refreshes)
+        attention_dtype = self.model.packed_attention_dtype
+        if attention_dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError("Packed Irodori attention dtype became unavailable.")
+        context_cache_key = (
+            tuple(
+                (state.request_id, id(sampling_state))
+                for state, sampling_state in zip(
+                    states,
+                    sampling_states,
+                    strict=True,
+                )
+            ),
+            tuple(context_modes),
+            attention_dtype,
+        )
+        packed_context = self._packed_context_batches.get(context_cache_key)
+        if packed_context is None:
+            packed_context = pack_irodori_batch_context(
+                sampling_states,
+                modes=context_modes,
+                attention_dtype=attention_dtype,
+            )
+            self._packed_context_batches[context_cache_key] = packed_context
+        self._packed_context_batches.move_to_end(context_cache_key)
+        # Each entry owns K/V for all layers and all requests, so keep only the
+        # handful of phase layouts a live composition can revisit. Scaling the
+        # entry count with max_num_seqs would retain GiBs at high concurrency.
+        while len(self._packed_context_batches) > 4:
+            self._packed_context_batches.popitem(last=False)
+        return packed_context
+
     def clear_cuda_graphs(self) -> None:
         self.cuda_graph_runner.clear()
         self._denoise_batches.clear()
+        self._packed_context_batches.clear()
+        self.model._packed_layout_cache.clear()
 
     def get_cuda_graph_stats(self) -> dict[str, int]:
         return self.cuda_graph_runner.stats()

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import asdict
 from typing import Any
 
@@ -22,6 +23,8 @@ from vllm_omni.diffusion.attention.backends.utils.fa import (
 from .config import ModelConfig
 from .precision import (
     IEEE as IEEE_MATMUL,
+)
+from .precision import (
     IrodoriPrecisionPolicy,
     matmul_precision,
     supported_attention_dtype,
@@ -63,9 +66,7 @@ def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
     freqs = 1000.0 * torch.exp(
-        -math.log(10000.0)
-        * torch.arange(half, device=timestep.device, dtype=torch.float32)
-        / half
+        -math.log(10000.0) * torch.arange(half, device=timestep.device, dtype=torch.float32) / half
     )
     args = timestep[:, None].float() * freqs[None, :]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
@@ -136,9 +137,7 @@ class LowRankAdaLN(nn.Module):
         gate = torch.tanh(gate)
         return x.to(x_dtype), gate
 
-    def forward(
-        self, x: torch.Tensor, cond_embed: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, cond_embed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self._apply_modulation(x, *self._project_condition(cond_embed))
 
     def forward_packed(
@@ -180,20 +179,15 @@ def patch_sequence_with_mask(
     if patch_size <= 1:
         return seq, mask
     if seq.ndim != 3 or mask.ndim != 2:
-        raise ValueError(
-            f"Expected seq=(B,S,D), mask=(B,S), got seq={tuple(seq.shape)} mask={tuple(mask.shape)}"
-        )
+        raise ValueError(f"Expected seq=(B,S,D), mask=(B,S), got seq={tuple(seq.shape)} mask={tuple(mask.shape)}")
     if seq.shape[0] != mask.shape[0] or seq.shape[1] != mask.shape[1]:
         raise ValueError(
-            f"Sequence/mask shape mismatch: seq={tuple(seq.shape)}, mask={tuple(mask.shape)}. "
-            "Expected matching (B,S)."
+            f"Sequence/mask shape mismatch: seq={tuple(seq.shape)}, mask={tuple(mask.shape)}. Expected matching (B,S)."
         )
     bsz, seq_len, dim = seq.shape
     usable = (seq_len // patch_size) * patch_size
     if usable <= 0:
-        raise ValueError(
-            f"Reference sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}"
-        )
+        raise ValueError(f"Reference sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}")
     seq = seq[:, :usable].reshape(bsz, usable // patch_size, dim * patch_size)
     mask = mask[:, :usable].reshape(bsz, usable // patch_size, patch_size).all(dim=-1)
     return seq, mask
@@ -373,9 +367,7 @@ class JointAttention(nn.Module):
         boundaries.  No latent or context padding participates in the DiT.
         """
         if flash_attn_varlen_func is None:
-            raise RuntimeError(
-                "Packed Irodori attention requires a varlen FlashAttention kernel."
-            )
+            raise RuntimeError("Packed Irodori attention requires a varlen FlashAttention kernel.")
         if x.shape[0] != 1:
             raise ValueError("Packed Irodori attention expects physical batch size 1.")
 
@@ -389,9 +381,7 @@ class JointAttention(nn.Module):
         output_dtype = q.dtype
         attention_dtype = self.attention_dtype
         if attention_dtype is None:
-            raise RuntimeError(
-                "Packed Irodori attention requires a BF16/FP16 attention policy."
-            )
+            raise RuntimeError("Packed Irodori attention requires a BF16/FP16 attention policy.")
         q = q.to(attention_dtype)
         k_self = k_self.to(attention_dtype)
         v_self = v_self.to(attention_dtype)
@@ -435,19 +425,13 @@ class JointAttention(nn.Module):
         Precompute conditioning KV projections for static conditioning.
         """
         bsz = text_context.shape[0]
-        k_text = self.wk_text(text_context).reshape(
-            bsz, text_context.shape[1], self.heads, self.head_dim
-        )
-        v_text = self.wv_text(text_context).reshape(
-            bsz, text_context.shape[1], self.heads, self.head_dim
-        )
+        k_text = self.wk_text(text_context).reshape(bsz, text_context.shape[1], self.heads, self.head_dim)
+        v_text = self.wv_text(text_context).reshape(bsz, text_context.shape[1], self.heads, self.head_dim)
         k_text = self.k_norm(k_text)
         projected: list[torch.Tensor] = [k_text, v_text]
         if self.has_speaker_condition:
             if speaker_context is None:
-                raise ValueError(
-                    "speaker_context is required when speaker conditioning is enabled."
-                )
+                raise ValueError("speaker_context is required when speaker conditioning is enabled.")
             if speaker_context.shape[0] != bsz:
                 raise ValueError(
                     "Batch mismatch for context projection: "
@@ -475,12 +459,8 @@ class JointAttention(nn.Module):
                 "Batch mismatch for caption context projection: "
                 f"text={tuple(text_context.shape)} caption={tuple(caption_context.shape)}"
             )
-        k_caption = self.wk_caption(caption_context).reshape(
-            bsz, caption_context.shape[1], self.heads, self.head_dim
-        )
-        v_caption = self.wv_caption(caption_context).reshape(
-            bsz, caption_context.shape[1], self.heads, self.head_dim
-        )
+        k_caption = self.wk_caption(caption_context).reshape(bsz, caption_context.shape[1], self.heads, self.head_dim)
+        v_caption = self.wv_caption(caption_context).reshape(bsz, caption_context.shape[1], self.heads, self.head_dim)
         k_caption = self.k_norm(k_caption)
         projected.extend([k_caption, v_caption])
         return tuple(projected)
@@ -541,9 +521,7 @@ class JointAttention(nn.Module):
         context_masks = [self_mask, text_mask]
         if self.has_speaker_condition:
             if speaker_context is None or k_speaker is None or v_speaker is None:
-                raise ValueError(
-                    "speaker_context is required when speaker conditioning is enabled."
-                )
+                raise ValueError("speaker_context is required when speaker conditioning is enabled.")
             if speaker_mask is None:
                 speaker_mask = torch.ones(
                     (bsz, speaker_context.shape[1]),
@@ -555,9 +533,7 @@ class JointAttention(nn.Module):
             context_masks.append(speaker_mask)
         if self.has_caption_condition:
             if caption_context is None:
-                raise ValueError(
-                    "caption_context is required when caption conditioning is enabled."
-                )
+                raise ValueError("caption_context is required when caption conditioning is enabled.")
             if caption_mask is None:
                 caption_mask = torch.ones(
                     (bsz, caption_context.shape[1]),
@@ -565,9 +541,7 @@ class JointAttention(nn.Module):
                     device=x.device,
                 )
             if k_caption is None or v_caption is None:
-                raise RuntimeError(
-                    "Caption projections are missing despite enabled caption conditioning."
-                )
+                raise RuntimeError("Caption projections are missing despite enabled caption conditioning.")
             context_k.append(k_caption)
             context_v.append(v_caption)
             context_masks.append(caption_mask)
@@ -653,10 +627,7 @@ def _safe_attention_mask(
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mask.ndim != 2 or mask.shape[0] != x.shape[0] or mask.shape[1] != x.shape[1]:
-        raise ValueError(
-            f"mask must have shape (B, S) matching x, got x={tuple(x.shape)} "
-            f"mask={tuple(mask.shape)}"
-        )
+        raise ValueError(f"mask must have shape (B, S) matching x, got x={tuple(x.shape)} mask={tuple(mask.shape)}")
     mask = mask.to(device=x.device, dtype=torch.bool)
     has_any = mask.any(dim=1)
     if bool(has_any.all()):
@@ -739,13 +710,9 @@ class CrossAttentionPooling(nn.Module):
         context_mask: torch.Tensor,
     ) -> torch.Tensor:
         if query.ndim != 2 or query.shape[-1] != self.query_dim:
-            raise ValueError(
-                f"query must have shape (B, {self.query_dim}), got {tuple(query.shape)}"
-            )
+            raise ValueError(f"query must have shape (B, {self.query_dim}), got {tuple(query.shape)}")
         if context.ndim != 3 or context.shape[-1] != self.context_dim:
-            raise ValueError(
-                f"context must have shape (B, S, {self.context_dim}), got {tuple(context.shape)}"
-            )
+            raise ValueError(f"context must have shape (B, S, {self.context_dim}), got {tuple(context.shape)}")
         context, context_mask = _safe_attention_mask(context, context_mask)
         bsz, seq_len, _ = context.shape
         q = query[:, None, :]
@@ -806,12 +773,10 @@ class DurationSwiGLUBlock(nn.Module):
                 shift, scale, gate = self.modulation(F.silu(cond)).chunk(3, dim=-1)
             if self.caption_modulation is not None:
                 if caption_cond is None:
-                    raise ValueError(
-                        "caption_cond is required for caption AdaRN-Zero duration blocks."
-                    )
-                caption_shift, caption_scale, caption_gate = self.caption_modulation(
-                    F.silu(caption_cond)
-                ).chunk(3, dim=-1)
+                    raise ValueError("caption_cond is required for caption AdaRN-Zero duration blocks.")
+                caption_shift, caption_scale, caption_gate = self.caption_modulation(F.silu(caption_cond)).chunk(
+                    3, dim=-1
+                )
                 if shift is None:
                     shift, scale, gate = caption_shift, caption_scale, caption_gate
                 else:
@@ -839,9 +804,7 @@ class TextBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        x = x + self.dropout(
-            self.attention(self.attention_norm(x), key_mask=mask, freqs_cis=freqs_cis)
-        )
+        x = x + self.dropout(self.attention(self.attention_norm(x), key_mask=mask, freqs_cis=freqs_cis))
         x = x + self.dropout(self.mlp(self.mlp_norm(x)))
         return x
 
@@ -871,9 +834,7 @@ class TextEncoder(nn.Module):
             for _ in range(layers)
         )
         self.head_dim = dim // heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -910,9 +871,7 @@ class PretrainedTextBackbone(nn.Module):
             from transformers import AutoConfig, AutoModel
             from transformers.initialization import no_init_weights
         except ImportError as exc:
-            raise RuntimeError(
-                "transformers is required when text_encoder_type='pretrained'."
-            ) from exc
+            raise RuntimeError("transformers is required when text_encoder_type='pretrained'.") from exc
 
         if config_dict is None:
             config = AutoConfig.from_pretrained(
@@ -934,9 +893,7 @@ class PretrainedTextBackbone(nn.Module):
                     T5Gemma2TextEncoder,
                 )
             except ImportError as exc:
-                raise RuntimeError(
-                    "The installed transformers version does not expose T5Gemma2TextEncoder."
-                ) from exc
+                raise RuntimeError("The installed transformers version does not expose T5Gemma2TextEncoder.") from exc
             if load_pretrained_weights:
                 backbone = T5Gemma2TextEncoder.from_pretrained(
                     repo_id,
@@ -971,9 +928,7 @@ class PretrainedTextBackbone(nn.Module):
             if bool(getattr(config, "is_encoder_decoder", False)):
                 get_encoder = getattr(loaded_model, "get_encoder", None)
                 if get_encoder is None:
-                    raise ValueError(
-                        f"Encoder-decoder model does not expose get_encoder(): {repo_id}"
-                    )
+                    raise ValueError(f"Encoder-decoder model does not expose get_encoder(): {repo_id}")
                 encoder = get_encoder()
                 backbone = getattr(encoder, "text_model", encoder)
             else:
@@ -1000,9 +955,7 @@ class PretrainedTextBackbone(nn.Module):
         return state * mask.unsqueeze(-1).to(dtype=state.dtype)
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
-        method_name = (
-            "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
-        )
+        method_name = "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
         method = getattr(self.backbone, method_name, None)
         if callable(method):
             method()
@@ -1038,10 +991,7 @@ class PretrainedConditionProjector(nn.Module):
         super().__init__()
         projector_type = str(projector_type).strip().lower()
         if projector_type not in {"linear", "residual_mlp"}:
-            raise ValueError(
-                "pretrained projector type must be 'linear' or 'residual_mlp', "
-                f"got {projector_type!r}."
-            )
+            raise ValueError(f"pretrained projector type must be 'linear' or 'residual_mlp', got {projector_type!r}.")
         if hidden_ratio <= 0:
             raise ValueError(f"projector hidden_ratio must be > 0, got {hidden_ratio}.")
         if not 0.0 <= dropout <= 1.0:
@@ -1078,10 +1028,7 @@ class PretrainedConditionProjector(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         state = backbone(input_ids, mask)
-        if (
-            not torch.is_autocast_enabled(state.device.type)
-            and state.dtype != self.projector.weight.dtype
-        ):
+        if not torch.is_autocast_enabled(state.device.type) and state.dtype != self.projector.weight.dtype:
             state = state.to(dtype=self.projector.weight.dtype)
         projected = self.projector(state)
         if self.projector_type == "residual_mlp":
@@ -1119,9 +1066,7 @@ class ReferenceLatentEncoder(nn.Module):
             for _ in range(cfg.speaker_layers)
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -1317,31 +1262,25 @@ class DurationPredictor(nn.Module):
         speaker_fusion = str(speaker_fusion).strip().lower()
         if speaker_fusion not in DURATION_SPEAKER_FUSIONS:
             raise ValueError(
-                f"duration speaker fusion must be one of {sorted(DURATION_SPEAKER_FUSIONS)}, "
-                f"got {speaker_fusion!r}"
+                f"duration speaker fusion must be one of {sorted(DURATION_SPEAKER_FUSIONS)}, got {speaker_fusion!r}"
             )
         caption_fusion = str(caption_fusion).strip().lower()
         if caption_fusion not in DURATION_CAPTION_FUSIONS:
             raise ValueError(
-                f"duration caption fusion must be one of {sorted(DURATION_CAPTION_FUSIONS)}, "
-                f"got {caption_fusion!r}"
+                f"duration caption fusion must be one of {sorted(DURATION_CAPTION_FUSIONS)}, got {caption_fusion!r}"
             )
         caption_pooling = str(caption_pooling).strip().lower()
         if caption_pooling not in DURATION_CAPTION_POOLINGS:
             raise ValueError(
-                f"duration caption pooling must be one of {sorted(DURATION_CAPTION_POOLINGS)}, "
-                f"got {caption_pooling!r}"
+                f"duration caption pooling must be one of {sorted(DURATION_CAPTION_POOLINGS)}, got {caption_pooling!r}"
             )
         architecture = str(architecture).strip().lower()
         if architecture not in DURATION_ARCHITECTURES:
             raise ValueError(
-                "duration architecture must be one of "
-                f"{sorted(DURATION_ARCHITECTURES)}, got {architecture!r}"
+                f"duration architecture must be one of {sorted(DURATION_ARCHITECTURES)}, got {architecture!r}"
             )
         if attention_heads <= 0:
-            raise ValueError(
-                f"duration predictor attention_heads must be > 0, got {attention_heads}"
-            )
+            raise ValueError(f"duration predictor attention_heads must be > 0, got {attention_heads}")
         if token_init_frames <= 0:
             raise ValueError(f"duration token_init_frames must be > 0, got {token_init_frames}")
         if speaker_dim is None and speaker_fusion != "concat":
@@ -1353,12 +1292,8 @@ class DurationPredictor(nn.Module):
                 "token_sum_adarn_zero_no_aux uses block-level speaker AdaRN-Zero and "
                 "requires speaker_fusion='adarn_zero'."
             )
-        if architecture == "token_sum_dual_adarn_zero_no_aux" and (
-            speaker_dim is None or caption_dim is None
-        ):
-            raise ValueError(
-                "token_sum_dual_adarn_zero_no_aux requires speaker_dim and caption_dim."
-            )
+        if architecture == "token_sum_dual_adarn_zero_no_aux" and (speaker_dim is None or caption_dim is None):
+            raise ValueError("token_sum_dual_adarn_zero_no_aux requires speaker_dim and caption_dim.")
         if architecture == "token_sum_dual_adarn_zero_no_aux" and speaker_fusion != "adarn_zero":
             raise ValueError(
                 "token_sum_dual_adarn_zero_no_aux uses block-level speaker AdaRN-Zero and "
@@ -1380,12 +1315,8 @@ class DurationPredictor(nn.Module):
         self.caption_pooling = caption_pooling
         self.duration_architecture = architecture
         self.text_pool = None
-        self.null_speaker = (
-            nn.Parameter(torch.zeros(int(speaker_dim))) if speaker_dim is not None else None
-        )
-        self.null_caption = (
-            nn.Parameter(torch.zeros(int(caption_dim))) if caption_dim is not None else None
-        )
+        self.null_speaker = nn.Parameter(torch.zeros(int(speaker_dim))) if speaker_dim is not None else None
+        self.null_caption = nn.Parameter(torch.zeros(int(caption_dim))) if caption_dim is not None else None
         self.text_adarn_norm = None
         self.text_adarn = None
         self.speaker_cross_attn = None
@@ -1407,11 +1338,7 @@ class DurationPredictor(nn.Module):
                     dropout=float(dropout),
                     norm_eps=float(norm_eps),
                     cond_dim=int(speaker_dim),
-                    caption_cond_dim=(
-                        int(caption_dim)
-                        if architecture == "token_sum_dual_adarn_zero_no_aux"
-                        else None
-                    ),
+                    caption_cond_dim=(int(caption_dim) if architecture == "token_sum_dual_adarn_zero_no_aux" else None),
                 )
                 for _ in range(int(layers))
             )
@@ -1494,13 +1421,9 @@ class DurationPredictor(nn.Module):
         if speaker_state is None:
             return null_vec
         if speaker_state.ndim != 3 or speaker_state.shape[0] != batch_size:
-            raise ValueError(
-                f"speaker_state must have shape (B, S, D), got {tuple(speaker_state.shape)}"
-            )
+            raise ValueError(f"speaker_state must have shape (B, S, D), got {tuple(speaker_state.shape)}")
         if speaker_state.shape[-1] != self.speaker_dim:
-            raise ValueError(
-                f"speaker_state last dim must be {self.speaker_dim}, got {speaker_state.shape[-1]}"
-            )
+            raise ValueError(f"speaker_state last dim must be {self.speaker_dim}, got {speaker_state.shape[-1]}")
         speaker_vec = speaker_state[:, 0].to(device=device, dtype=dtype)
         return torch.where(has_speaker[:, None], speaker_vec, null_vec)
 
@@ -1520,18 +1443,12 @@ class DurationPredictor(nn.Module):
         if caption_state is None:
             return null_vec
         if caption_state.ndim != 3 or caption_state.shape[0] != batch_size:
-            raise ValueError(
-                f"caption_state must have shape (B, S, D), got {tuple(caption_state.shape)}"
-            )
+            raise ValueError(f"caption_state must have shape (B, S, D), got {tuple(caption_state.shape)}")
         if caption_state.shape[-1] != self.caption_dim:
-            raise ValueError(
-                f"caption_state last dim must be {self.caption_dim}, got {caption_state.shape[-1]}"
-            )
+            raise ValueError(f"caption_state last dim must be {self.caption_dim}, got {caption_state.shape[-1]}")
         caption_state = caption_state.to(device=device, dtype=dtype)
         if caption_mask is None:
-            caption_mask = torch.ones(
-                (batch_size, caption_state.shape[1]), dtype=torch.bool, device=device
-            )
+            caption_mask = torch.ones((batch_size, caption_state.shape[1]), dtype=torch.bool, device=device)
         elif caption_mask.ndim != 2 or caption_mask.shape[:2] != caption_state.shape[:2]:
             raise ValueError(
                 "caption_mask must have shape matching caption_state (B, S), "
@@ -1555,24 +1472,16 @@ class DurationPredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.null_speaker is None or self.speaker_dim is None:
             raise RuntimeError("Duration speaker modules are missing.")
-        null_token = self.null_speaker.to(device=device, dtype=dtype)[None, None, :].expand(
-            batch_size, 1, -1
-        )
+        null_token = self.null_speaker.to(device=device, dtype=dtype)[None, None, :].expand(batch_size, 1, -1)
         if speaker_state is None:
             return null_token, torch.ones((batch_size, 1), dtype=torch.bool, device=device)
         if speaker_state.ndim != 3 or speaker_state.shape[0] != batch_size:
-            raise ValueError(
-                f"speaker_state must have shape (B, S, D), got {tuple(speaker_state.shape)}"
-            )
+            raise ValueError(f"speaker_state must have shape (B, S, D), got {tuple(speaker_state.shape)}")
         if speaker_state.shape[-1] != self.speaker_dim:
-            raise ValueError(
-                f"speaker_state last dim must be {self.speaker_dim}, got {speaker_state.shape[-1]}"
-            )
+            raise ValueError(f"speaker_state last dim must be {self.speaker_dim}, got {speaker_state.shape[-1]}")
         speaker_state = speaker_state.to(device=device, dtype=dtype)
         if speaker_mask is None:
-            speaker_mask = torch.ones(
-                (batch_size, speaker_state.shape[1]), dtype=torch.bool, device=device
-            )
+            speaker_mask = torch.ones((batch_size, speaker_state.shape[1]), dtype=torch.bool, device=device)
         elif speaker_mask.ndim != 2 or speaker_mask.shape[:2] != speaker_state.shape[:2]:
             raise ValueError(
                 "speaker_mask must have shape matching speaker_state (B, S), "
@@ -1599,13 +1508,9 @@ class DurationPredictor(nn.Module):
         has_caption: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_state.ndim != 3 or text_state.shape[-1] != self.text_dim:
-            raise ValueError(
-                f"text_state must have shape (B, S, {self.text_dim}), got {tuple(text_state.shape)}"
-            )
+            raise ValueError(f"text_state must have shape (B, S, {self.text_dim}), got {tuple(text_state.shape)}")
         if aux_features.ndim != 2 or aux_features.shape[1] != self.aux_dim:
-            raise ValueError(
-                f"aux_features must have shape (B, {self.aux_dim}), got {tuple(aux_features.shape)}"
-            )
+            raise ValueError(f"aux_features must have shape (B, {self.aux_dim}), got {tuple(aux_features.shape)}")
         if aux_features.shape[0] != text_state.shape[0]:
             raise ValueError(
                 "Batch mismatch for duration predictor: "
@@ -1621,14 +1526,10 @@ class DurationPredictor(nn.Module):
             if self.speaker_dim is None:
                 raise RuntimeError("Token-sum duration architecture requires speaker modules.")
             if has_speaker is None:
-                raise ValueError(
-                    "has_speaker is required for speaker-conditioned duration prediction."
-                )
+                raise ValueError("has_speaker is required for speaker-conditioned duration prediction.")
             has_speaker = has_speaker.to(device=text_state.device, dtype=torch.bool)
             if has_speaker.ndim != 1 or has_speaker.shape[0] != text_state.shape[0]:
-                raise ValueError(
-                    f"has_speaker must have shape (B,), got {tuple(has_speaker.shape)}"
-                )
+                raise ValueError(f"has_speaker must have shape (B,), got {tuple(has_speaker.shape)}")
             speaker_vec = self._speaker_vec(
                 batch_size=text_state.shape[0],
                 device=text_state.device,
@@ -1639,18 +1540,12 @@ class DurationPredictor(nn.Module):
             caption_vec = None
             if self.duration_architecture == "token_sum_dual_adarn_zero_no_aux":
                 if self.caption_dim is None:
-                    raise RuntimeError(
-                        "Dual token-sum duration architecture requires caption modules."
-                    )
+                    raise RuntimeError("Dual token-sum duration architecture requires caption modules.")
                 if has_caption is None:
-                    raise ValueError(
-                        "has_caption is required for caption-conditioned duration prediction."
-                    )
+                    raise ValueError("has_caption is required for caption-conditioned duration prediction.")
                 has_caption = has_caption.to(device=text_state.device, dtype=torch.bool)
                 if has_caption.ndim != 1 or has_caption.shape[0] != text_state.shape[0]:
-                    raise ValueError(
-                        f"has_caption must have shape (B,), got {tuple(has_caption.shape)}"
-                    )
+                    raise ValueError(f"has_caption must have shape (B,), got {tuple(has_caption.shape)}")
                 caption_vec = self._caption_vec(
                     batch_size=text_state.shape[0],
                     device=text_state.device,
@@ -1877,9 +1772,10 @@ class TextToLatentRFDiT(nn.Module):
         self.head_dim = cfg.model_dim // cfg.num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False)
+        # Exact-token layout tensors depend only on request composition, not on
+        # the denoising timestep. Keep them resident across the 40-step loop.
+        self._packed_layout_cache: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = bool(enabled)
@@ -1938,19 +1834,13 @@ class TextToLatentRFDiT(nn.Module):
         if state.ndim == 2:
             state = state.unsqueeze(0)
         if state.ndim != 3:
-            raise ValueError(
-                f"speaker_state must have shape (B,S,D) or (S,D), got {tuple(state.shape)}"
-            )
+            raise ValueError(f"speaker_state must have shape (B,S,D) or (S,D), got {tuple(state.shape)}")
         if int(state.shape[-1]) != int(speaker_dim):
-            raise ValueError(
-                f"speaker_state last dim must be {int(speaker_dim)}, got {int(state.shape[-1])}"
-            )
+            raise ValueError(f"speaker_state last dim must be {int(speaker_dim)}, got {int(state.shape[-1])}")
         if state.shape[0] == 1 and batch_size != 1:
             state = state.expand(batch_size, -1, -1)
         elif int(state.shape[0]) != int(batch_size):
-            raise ValueError(
-                f"speaker_state batch mismatch: expected {int(batch_size)}, got {int(state.shape[0])}"
-            )
+            raise ValueError(f"speaker_state batch mismatch: expected {int(batch_size)}, got {int(state.shape[0])}")
 
         if mask is None:
             mask = torch.ones(state.shape[:2], dtype=torch.bool, device=state.device)
@@ -1958,20 +1848,13 @@ class TextToLatentRFDiT(nn.Module):
             if mask.ndim == 1:
                 mask = mask.unsqueeze(0)
             if mask.ndim != 2:
-                raise ValueError(
-                    f"speaker_mask must have shape (B,S) or (S,), got {tuple(mask.shape)}"
-                )
+                raise ValueError(f"speaker_mask must have shape (B,S) or (S,), got {tuple(mask.shape)}")
             if mask.shape[0] == 1 and batch_size != 1:
                 mask = mask.expand(batch_size, -1)
             elif int(mask.shape[0]) != int(batch_size):
-                raise ValueError(
-                    f"speaker_mask batch mismatch: expected {int(batch_size)}, got {int(mask.shape[0])}"
-                )
+                raise ValueError(f"speaker_mask batch mismatch: expected {int(batch_size)}, got {int(mask.shape[0])}")
             if int(mask.shape[1]) != int(state.shape[1]):
-                raise ValueError(
-                    "speaker_mask token mismatch: "
-                    f"state={tuple(state.shape)} mask={tuple(mask.shape)}"
-                )
+                raise ValueError(f"speaker_mask token mismatch: state={tuple(state.shape)} mask={tuple(mask.shape)}")
             mask = mask.to(device=state.device, dtype=torch.bool)
         return state, mask
 
@@ -1996,8 +1879,7 @@ class TextToLatentRFDiT(nn.Module):
         mode = str(uncond_mode).strip().lower()
         if mode not in SPEAKER_INVERSION_UNCOND_MODES:
             raise ValueError(
-                f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, "
-                f"got {uncond_mode!r}"
+                f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, got {uncond_mode!r}"
             )
         if mode == "noise":
             if uncond_state is None:
@@ -2060,7 +1942,9 @@ class TextToLatentRFDiT(nn.Module):
             return IEEE_MATMUL
         return getattr(policy, f"{stage}_matmul")
 
-    def encode_conditions(self, *args: Any, **kwargs: Any) -> tuple[
+    def encode_conditions(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
@@ -2119,25 +2003,15 @@ class TextToLatentRFDiT(nn.Module):
             has_direct_speaker = speaker_state_override is not None or isinstance(
                 speaker_inversion, SpeakerInversionEmbedding
             )
-            if not has_direct_speaker and (
-                self.speaker_encoder is None or self.speaker_norm is None
-            ):
-                raise RuntimeError(
-                    "Speaker conditioning is enabled but speaker modules are missing."
-                )
+            if not has_direct_speaker and (self.speaker_encoder is None or self.speaker_norm is None):
+                raise RuntimeError("Speaker conditioning is enabled but speaker modules are missing.")
             if not has_direct_speaker and (ref_latent is None or ref_mask is None):
-                raise ValueError(
-                    "ref_latent and ref_mask are required when speaker conditioning is enabled."
-                )
+                raise ValueError("ref_latent and ref_mask are required when speaker conditioning is enabled.")
         elif speaker_state_override is not None:
-            raise ValueError(
-                "speaker_state_override was provided but speaker conditioning is disabled."
-            )
+            raise ValueError("speaker_state_override was provided but speaker conditioning is disabled.")
         if self.cfg.use_caption_condition:
             if self.caption_encoder is None or self.caption_norm is None:
-                raise RuntimeError(
-                    "Caption conditioning is enabled but caption modules are missing."
-                )
+                raise RuntimeError("Caption conditioning is enabled but caption modules are missing.")
             if caption_input_ids is None or caption_mask is None:
                 raise ValueError(
                     "caption_input_ids and caption_mask are required when caption conditioning is enabled."
@@ -2192,9 +2066,7 @@ class TextToLatentRFDiT(nn.Module):
             if self.pretrained_text_backbone is None:
                 caption_state = self.caption_encoder(caption_input_ids, caption_mask)
             else:
-                caption_state = self.caption_encoder(
-                    self.pretrained_text_backbone, caption_input_ids, caption_mask
-                )
+                caption_state = self.caption_encoder(self.pretrained_text_backbone, caption_input_ids, caption_mask)
             caption_state = self.caption_norm(caption_state)
         return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask
 
@@ -2264,13 +2136,9 @@ class TextToLatentRFDiT(nn.Module):
     ) -> torch.Tensor:
         """Run the DiT over packed valid tokens from heterogeneous requests."""
         if not self.supports_packed_varlen_attention():
-            raise RuntimeError(
-                "Packed Irodori execution requires CUDA BF16/FP16 varlen FlashAttention."
-            )
+            raise RuntimeError("Packed Irodori execution requires CUDA BF16/FP16 varlen FlashAttention.")
         if x_t.ndim != 3 or x_t.shape[0] != 1:
-            raise ValueError(
-                f"Packed Irodori x_t must have shape (1, tokens, dim), got {tuple(x_t.shape)}."
-            )
+            raise ValueError(f"Packed Irodori x_t must have shape (1, tokens, dim), got {tuple(x_t.shape)}.")
         if not query_lengths or len(query_lengths) != len(context_lengths):
             raise ValueError("Packed Irodori query/context layouts must be non-empty and aligned.")
         if t.ndim != 1 or t.shape[0] != len(query_lengths):
@@ -2280,70 +2148,20 @@ class TextToLatentRFDiT(nn.Module):
         if len(context_kv_cache) != len(self.blocks):
             raise ValueError("Packed Irodori context K/V layer count does not match the DiT.")
 
-        device = x_t.device
-        query_lengths_tensor = torch.tensor(
-            query_lengths,
-            dtype=torch.long,
-            device=device,
-        )
         t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
         cond_embed = self.cond_module(t_embed)
-        token_sequence_indices = torch.repeat_interleave(
-            torch.arange(len(query_lengths), dtype=torch.long, device=device),
-            query_lengths_tensor,
-        )
-
-        query_offsets = [0]
-        key_offsets = [0]
-        self_positions: list[torch.Tensor] = []
-        context_positions: list[torch.Tensor] = []
-        position_ids: list[torch.Tensor] = []
-        for query_length, context_length in zip(
-            query_lengths,
-            context_lengths,
-            strict=True,
-        ):
-            query_start = query_offsets[-1]
-            key_start = key_offsets[-1]
-            query_offsets.append(query_start + query_length)
-            key_offsets.append(key_start + query_length + context_length)
-            self_positions.append(
-                torch.arange(
-                    key_start,
-                    key_start + query_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-            )
-            context_positions.append(
-                torch.arange(
-                    key_start + query_length,
-                    key_start + query_length + context_length,
-                    dtype=torch.long,
-                    device=device,
-                )
-            )
-            position_ids.append(
-                torch.arange(query_length, dtype=torch.long, device=device)
-            )
-
-        self_kv_indices = torch.cat(self_positions)
-        context_kv_indices = torch.cat(context_positions)
-        cu_seqlens_q = torch.tensor(query_offsets, dtype=torch.int32, device=device)
-        cu_seqlens_k = torch.tensor(key_offsets, dtype=torch.int32, device=device)
-        packed_position_ids = torch.cat(position_ids)
-        freqs = self._rope_freqs(max(query_lengths), device)[packed_position_ids]
+        (
+            token_sequence_indices,
+            self_kv_indices,
+            context_kv_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            freqs,
+            max_seqlen_q,
+            max_seqlen_k,
+        ) = self._packed_layout(query_lengths, context_lengths, x_t.device)
 
         x = self.in_proj(x_t)
-        max_seqlen_q = max(query_lengths)
-        max_seqlen_k = max(
-            query_length + context_length
-            for query_length, context_length in zip(
-                query_lengths,
-                context_lengths,
-                strict=True,
-            )
-        )
         for block, context_kv in zip(
             self.blocks,
             context_kv_cache,
@@ -2375,6 +2193,90 @@ class TextToLatentRFDiT(nn.Module):
 
         x = self.out_proj(self.out_norm(x))
         return x.to(dtype=x_t.dtype)
+
+    def _packed_layout(
+        self,
+        query_lengths: tuple[int, ...],
+        context_lengths: tuple[int, ...],
+        device: torch.device,
+    ) -> tuple[Any, ...]:
+        """Return composition-static FA4 indices and RoPE rows."""
+        cache_key = (
+            query_lengths,
+            context_lengths,
+            device.type,
+            device.index,
+        )
+        cached = self._packed_layout_cache.get(cache_key)
+        if cached is not None:
+            self._packed_layout_cache.move_to_end(cache_key)
+            return cached
+
+        query_lengths_tensor = torch.tensor(
+            query_lengths,
+            dtype=torch.long,
+            device=device,
+        )
+        token_sequence_indices = torch.repeat_interleave(
+            torch.arange(len(query_lengths), dtype=torch.long, device=device),
+            query_lengths_tensor,
+        )
+        query_offsets = [0]
+        key_offsets = [0]
+        self_positions: list[torch.Tensor] = []
+        context_positions: list[torch.Tensor] = []
+        position_ids: list[torch.Tensor] = []
+        for query_length, context_length in zip(
+            query_lengths,
+            context_lengths,
+            strict=True,
+        ):
+            query_start = query_offsets[-1]
+            key_start = key_offsets[-1]
+            query_offsets.append(query_start + query_length)
+            key_offsets.append(key_start + query_length + context_length)
+            self_positions.append(
+                torch.arange(
+                    key_start,
+                    key_start + query_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+            context_positions.append(
+                torch.arange(
+                    key_start + query_length,
+                    key_start + query_length + context_length,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+            position_ids.append(torch.arange(query_length, dtype=torch.long, device=device))
+
+        packed_position_ids = torch.cat(position_ids)
+        max_seqlen_q = max(query_lengths)
+        result = (
+            token_sequence_indices,
+            torch.cat(self_positions),
+            torch.cat(context_positions),
+            torch.tensor(query_offsets, dtype=torch.int32, device=device),
+            torch.tensor(key_offsets, dtype=torch.int32, device=device),
+            self._rope_freqs(max_seqlen_q, device)[packed_position_ids],
+            max_seqlen_q,
+            max(
+                query_length + context_length
+                for query_length, context_length in zip(
+                    query_lengths,
+                    context_lengths,
+                    strict=True,
+                )
+            ),
+        )
+        self._packed_layout_cache[cache_key] = result
+        self._packed_layout_cache.move_to_end(cache_key)
+        while len(self._packed_layout_cache) > 32:
+            self._packed_layout_cache.popitem(last=False)
+        return result
 
     def forward(
         self,
@@ -2435,11 +2337,7 @@ class TextToLatentRFDiT(nn.Module):
             if text_condition_dropout is not None:
                 text_mask_dit = text_mask_dit.clone()
                 text_mask_dit[text_condition_dropout] = False
-            if (
-                speaker_condition_dropout is not None
-                and speaker_state_dit is not None
-                and speaker_mask_dit is not None
-            ):
+            if speaker_condition_dropout is not None and speaker_state_dit is not None and speaker_mask_dit is not None:
                 speaker_state_dit, speaker_mask_dit = self._apply_speaker_condition_dropout(
                     speaker_state=speaker_state_dit,
                     speaker_mask=speaker_mask_dit,
@@ -2553,9 +2451,7 @@ class TextToLatentRFDiT(nn.Module):
         if self.duration_predictor is None:
             raise RuntimeError("Duration predictor is disabled for this model.")
         if duration_features.ndim != 2:
-            raise ValueError(
-                f"duration_features must have shape (B, D), got {tuple(duration_features.shape)}"
-            )
+            raise ValueError(f"duration_features must have shape (B, D), got {tuple(duration_features.shape)}")
         if duration_features.shape[1] != self.cfg.duration_aux_dim:
             raise ValueError(
                 "duration_features dim mismatch: "

@@ -2,6 +2,7 @@
 """Context bucket selection and prefix-length precomputation tests."""
 
 import types
+from collections import OrderedDict
 
 import pytest
 import torch
@@ -9,13 +10,19 @@ import torch
 from vllm_omni.diffusion.models.irodori_tts.batching import (
     IrodoriContextBucketPolicy,
     IrodoriDenoiseBatch,
+    IrodoriLengthState,
     _source_bucket,
 )
-from vllm_omni.diffusion.models.irodori_tts.pipeline_irodori_tts import IrodoriTTSPipeline
+from vllm_omni.diffusion.models.irodori_tts.model import TextToLatentRFDiT
+from vllm_omni.diffusion.models.irodori_tts.pipeline_irodori_tts import (
+    IrodoriTTSPipeline,
+    _IrodoriPreparedRequest,
+)
 from vllm_omni.diffusion.models.irodori_tts.sampler import (
     _bundle_prefix_lengths,
     _conditional_rows,
     run_packed_euler_rf_cfg_step,
+    run_packed_varlen_euler_rf_cfg_step,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -115,9 +122,9 @@ def _packed_batch(*, cfg_refresh: bool, correction: torch.Tensor | None = None):
     # distinct marker so a wrong row selection cannot go unnoticed.
     text_state = torch.arange(rows, dtype=torch.float32).reshape(rows, 1, 1).expand(rows, 2, 2)
     bundle = (text_state.contiguous(), torch.ones((rows, 2), dtype=torch.bool), None, None, None, None)
-    latents = torch.arange(
-        REQUESTS * LATENT_LEN * LATENT_DIM, dtype=torch.float32
-    ).reshape(REQUESTS, LATENT_LEN, LATENT_DIM)
+    latents = torch.arange(REQUESTS * LATENT_LEN * LATENT_DIM, dtype=torch.float32).reshape(
+        REQUESTS, LATENT_LEN, LATENT_DIM
+    )
     return IrodoriDenoiseBatch(
         request_ids=tuple(f"r{i}" for i in range(REQUESTS)),
         cfg_active=True,
@@ -133,9 +140,7 @@ def _packed_batch(*, cfg_refresh: bool, correction: torch.Tensor | None = None):
         dynamic_context_buckets=(False, False, False),
         is_dynamic_latent_bucket=False,
         cfg_refresh=cfg_refresh,
-        cfg_correction=(
-            torch.zeros_like(latents) if cfg_refresh else correction
-        ),
+        cfg_correction=(torch.zeros_like(latents) if cfg_refresh else correction),
     )
 
 
@@ -201,9 +206,7 @@ def test_interval_one_always_refreshes():
 
 
 def test_interval_four_refreshes_every_fourth_step():
-    assert [_refresh(4, step) for step in range(8)] == [
-        True, False, False, False, True, False, False, False
-    ]
+    assert [_refresh(4, step) for step in range(8)] == [True, False, False, False, True, False, False, False]
 
 
 def test_a_request_without_a_carried_correction_always_refreshes():
@@ -212,6 +215,182 @@ def test_a_request_without_a_carried_correction_always_refreshes():
 
 def test_steps_with_cfg_disabled_never_reuse():
     assert _refresh(4, 5, cfg_active=False) is True
+
+
+class _StubPackedDiT:
+    dtype = torch.float32
+    device = torch.device("cpu")
+    packed_attention_dtype = torch.bfloat16
+
+    def __init__(self):
+        self.query_lengths: tuple[int, ...] = ()
+
+    def supports_packed_varlen_attention(self):
+        return True
+
+    def forward_with_packed_conditions(
+        self,
+        *,
+        x_t,
+        query_lengths,
+        **_,
+    ):
+        self.query_lengths = query_lengths
+        rows = []
+        offset = 0
+        for marker, length in enumerate(query_lengths):
+            rows.append(x_t[:, offset : offset + length] * 2.0 + marker)
+            offset += length
+        return torch.cat(rows, dim=1)
+
+
+def _varlen_state(*, cfg_active: bool, correction: float | None = None):
+    latent = torch.ones((1, 2, 1))
+    return types.SimpleNamespace(
+        latents=latent,
+        t_schedule=torch.tensor([0.8, 0.7]),
+        current_timestep=torch.tensor(0.8),
+        step_index=0,
+        cfg_active=(cfg_active,),
+        independent_names=("cond", "text", "speaker"),
+        cfg_scales={"text": 2.0, "speaker": 3.0},
+        cfg_guidance_mode="independent",
+        rescale_k=None,
+        rescale_sigma=None,
+        speaker_kv_active=False,
+        context_kv_cond=[],
+        context_kv_cfg=[],
+        valid_latent_lengths=(2,),
+        latent_mask=None,
+        cfg_correction=(None if correction is None else torch.full_like(latent, correction)),
+    )
+
+
+def test_varlen_batch_coalesces_active_inactive_and_reuse_cfg(monkeypatch):
+    states = [
+        _varlen_state(cfg_active=True),
+        _varlen_state(cfg_active=False),
+        _varlen_state(cfg_active=True, correction=7.0),
+    ]
+    observed_modes = []
+
+    def fake_pack_context(states, *, modes, attention_dtype):
+        observed_modes.extend(modes)
+        row_counts = [3 if mode == "cfg" else 1 for mode in modes]
+        return [], tuple(1 for count in row_counts for _ in range(count))
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.irodori_tts.sampler.pack_irodori_batch_context",
+        fake_pack_context,
+    )
+    model = _StubPackedDiT()
+    result = run_packed_varlen_euler_rf_cfg_step(
+        model,
+        states,
+        cfg_refreshes=[True, True, False],
+    )
+
+    assert observed_modes == ["cfg", "cond", "cond"]
+    assert model.query_lengths == (2, 2, 2, 2, 2)
+    # Active request rows are markers 0/1/2, so correction =
+    # 2*(0-1) + 3*(0-2) = -8. Inactive uses marker 3; reuse uses marker 4 + 7.
+    expected_velocities = [-6.0, 5.0, 13.0]
+    for updated, velocity in zip(result, expected_velocities, strict=True):
+        torch.testing.assert_close(
+            updated,
+            torch.ones_like(updated) + velocity * -0.1,
+        )
+    torch.testing.assert_close(states[0].cfg_correction, torch.full_like(states[0].latents, -8.0))
+
+
+def test_packed_execution_key_does_not_partition_cfg_phases():
+    model = _StubPackedDiT()
+    pipeline = types.SimpleNamespace(model=model)
+
+    def key_for(state):
+        prepared = _IrodoriPreparedRequest(
+            sampling_state=state,
+            lengths=IrodoriLengthState(
+                valid_codec_frames=4,
+                valid_latent_len=2,
+                bucket_latent_len=4,
+                target_samples=4,
+                is_dynamic_bucket=False,
+            ),
+            output_type="pt",
+            cfg_refresh_interval=1,
+        )
+        request = types.SimpleNamespace(
+            request_id="request",
+            extra={"irodori": prepared},
+        )
+        return IrodoriTTSPipeline.get_step_execution_key(pipeline, request)
+
+    active_key = key_for(_varlen_state(cfg_active=True))
+    inactive_key = key_for(_varlen_state(cfg_active=False))
+    assert active_key == inactive_key
+    assert active_key.bucket_latent_len is None
+    assert active_key.cfg_layout == ("packed-varlen",)
+
+
+def test_packed_layout_tensors_are_reused_for_the_same_composition():
+    model = types.SimpleNamespace(
+        _packed_layout_cache=OrderedDict(),
+        _rope_freqs=lambda seq_len, device: torch.arange(seq_len * 2).reshape(seq_len, 2),
+    )
+    first = TextToLatentRFDiT._packed_layout(
+        model,
+        (2, 3),
+        (4, 5),
+        torch.device("cpu"),
+    )
+    second = TextToLatentRFDiT._packed_layout(
+        model,
+        (2, 3),
+        (4, 5),
+        torch.device("cpu"),
+    )
+    assert first is second
+    assert len(model._packed_layout_cache) == 1
+
+
+def test_cross_request_context_concatenation_is_cached(monkeypatch):
+    sampling_states = [
+        _varlen_state(cfg_active=True),
+        _varlen_state(cfg_active=False),
+    ]
+    states = [types.SimpleNamespace(request_id=f"r{index}") for index in range(2)]
+    calls = []
+    expected = ([], (1, 1, 1, 1))
+
+    def fake_pack(states, *, modes, attention_dtype):
+        calls.append((tuple(modes), attention_dtype))
+        return expected
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.irodori_tts.pipeline_irodori_tts.pack_irodori_batch_context",
+        fake_pack,
+    )
+    pipeline = types.SimpleNamespace(
+        model=types.SimpleNamespace(packed_attention_dtype=torch.bfloat16),
+        od_config=types.SimpleNamespace(max_num_seqs=2),
+        _packed_context_batches=OrderedDict(),
+    )
+    first = IrodoriTTSPipeline._get_packed_batch_context(
+        pipeline,
+        states,
+        sampling_states,
+        [True, True],
+    )
+    second = IrodoriTTSPipeline._get_packed_batch_context(
+        pipeline,
+        states,
+        sampling_states,
+        [True, True],
+    )
+    assert first is expected
+    assert second is expected
+    assert calls == [(("cfg", "cond"), torch.bfloat16)]
 
 
 def _sampling_options(extra: dict):

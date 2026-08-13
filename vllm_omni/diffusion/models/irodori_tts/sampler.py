@@ -52,10 +52,9 @@ def sample_stratified_logit_normal_t(
     """
     if batch_size <= 0:
         return torch.empty((0,), device=device)
-    u = (
-        torch.arange(batch_size, device=device, dtype=torch.float32)
-        + torch.rand(batch_size, device=device)
-    ) / float(batch_size)
+    u = (torch.arange(batch_size, device=device, dtype=torch.float32) + torch.rand(batch_size, device=device)) / float(
+        batch_size
+    )
     u = u.clamp(1e-6, 1.0 - 1e-6)
     # Phi^{-1}(u) = sqrt(2) * erfinv(2u - 1)
     z = torch.erfinv(2.0 * u - 1.0) * (2.0**0.5)
@@ -111,9 +110,7 @@ def scale_speaker_kv_cache(
     for i in range(n_layers):
         layer_kv = context_kv_cache[i]
         if len(layer_kv) < 4:
-            raise ValueError(
-                f"Expected at least 4 tensors in context KV cache entry, got {len(layer_kv)}"
-            )
+            raise ValueError(f"Expected at least 4 tensors in context KV cache entry, got {len(layer_kv)}")
         k_speaker = layer_kv[2]
         v_speaker = layer_kv[3]
         k_speaker.mul_(scale)
@@ -182,9 +179,7 @@ class IrodoriSamplingState:
     cfg_correction: torch.Tensor | None = None
     # Lazily materialized exact, source-interleaved context K/V for packed
     # varlen attention.  It is request-static and reused for all 40 steps.
-    packed_context_cache: dict[tuple[str, torch.dtype], PackedContextState] = field(
-        default_factory=dict
-    )
+    packed_context_cache: dict[tuple[str, torch.dtype], PackedContextState] = field(default_factory=dict)
 
     def bundle_prefix_lengths(self, cfg_active: bool) -> BundlePrefixLengths:
         """Return the precomputed prefix lengths for the bundle in use."""
@@ -379,19 +374,12 @@ def prepare_euler_rf_cfg(
     else:
         if tuple(initial_latents.shape) != expected_shape:
             raise ValueError(
-                "initial_latents shape mismatch: "
-                f"expected {expected_shape}, got {tuple(initial_latents.shape)}."
+                f"initial_latents shape mismatch: expected {expected_shape}, got {tuple(initial_latents.shape)}."
             )
         if initial_latents.device != device:
-            raise ValueError(
-                "initial_latents device mismatch: "
-                f"expected {device}, got {initial_latents.device}."
-            )
+            raise ValueError(f"initial_latents device mismatch: expected {device}, got {initial_latents.device}.")
         if initial_latents.dtype != dtype:
-            raise ValueError(
-                "initial_latents dtype mismatch: "
-                f"expected {dtype}, got {initial_latents.dtype}."
-            )
+            raise ValueError(f"initial_latents dtype mismatch: expected {dtype}, got {initial_latents.dtype}.")
         x_t = initial_latents
     if truncation_factor is not None:
         x_t = x_t * float(truncation_factor)
@@ -399,8 +387,7 @@ def prepare_euler_rf_cfg(
     if latent_mask is not None:
         if tuple(latent_mask.shape) != (batch_size, sequence_length):
             raise ValueError(
-                "latent_mask shape mismatch: "
-                f"expected {(batch_size, sequence_length)}, got {tuple(latent_mask.shape)}."
+                f"latent_mask shape mismatch: expected {(batch_size, sequence_length)}, got {tuple(latent_mask.shape)}."
             )
         latent_mask = latent_mask.to(device=device, dtype=torch.bool)
     if bucket_sequence_length > sequence_length:
@@ -410,9 +397,7 @@ def prepare_euler_rf_cfg(
                 dtype=torch.bool,
                 device=device,
             )
-        latent_tail = x_t.new_zeros(
-            (batch_size, bucket_sequence_length - sequence_length, latent_dim)
-        )
+        latent_tail = x_t.new_zeros((batch_size, bucket_sequence_length - sequence_length, latent_dim))
         mask_tail = torch.zeros(
             (batch_size, bucket_sequence_length - sequence_length),
             dtype=torch.bool,
@@ -432,15 +417,13 @@ def prepare_euler_rf_cfg(
     speaker_uncond_mode = str(speaker_uncond_mode).strip().lower()
     if speaker_uncond_mode not in SPEAKER_INVERSION_UNCOND_MODES:
         raise ValueError(
-            f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, "
-            f"got {speaker_uncond_mode!r}"
+            f"speaker_uncond_mode must be one of {sorted(SPEAKER_INVERSION_UNCOND_MODES)}, got {speaker_uncond_mode!r}"
         )
 
     cfg_guidance_mode = str(cfg_guidance_mode).strip().lower()
     if cfg_guidance_mode not in {"independent", "joint", "alternating"}:
         raise ValueError(
-            f"Unsupported cfg_guidance_mode={cfg_guidance_mode!r}. "
-            "Expected one of: independent, joint, alternating."
+            f"Unsupported cfg_guidance_mode={cfg_guidance_mode!r}. Expected one of: independent, joint, alternating."
         )
 
     init_scale = 0.999
@@ -457,9 +440,7 @@ def prepare_euler_rf_cfg(
         u = u + sway_coeff_value * (torch.cos(0.5 * math.pi * u) + u - 1.0)
         u = u.clamp(0.0, 1.0)
     else:
-        raise ValueError(
-            f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'."
-        )
+        raise ValueError(f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'.")
     t_schedule = (1.0 - u) * init_scale
     if not bool(torch.all(t_schedule[:-1] > t_schedule[1:]).item()):
         raise ValueError("t_schedule must be strictly decreasing; adjust num_steps or sway_coeff.")
@@ -491,9 +472,7 @@ def prepare_euler_rf_cfg(
     speaker_mask_uncond = None
     if model.cfg.use_speaker_condition_resolved:
         if speaker_state_cond is None or speaker_mask_cond is None:
-            raise RuntimeError(
-                "Speaker conditioning is enabled but encoded speaker state is missing."
-            )
+            raise RuntimeError("Speaker conditioning is enabled but encoded speaker state is missing.")
         if speaker_uncond_mode == "noise":
             speaker_noise = torch.randn(
                 speaker_state_cond.shape,
@@ -512,9 +491,7 @@ def prepare_euler_rf_cfg(
     caption_mask_uncond = None
     if model.cfg.use_caption_condition:
         if caption_state_cond is None or caption_mask_cond is None:
-            raise RuntimeError(
-                "Caption conditioning is enabled but encoded caption state is missing."
-            )
+            raise RuntimeError("Caption conditioning is enabled but encoded caption state is missing.")
         caption_state_uncond = torch.zeros_like(caption_state_cond)
         caption_mask_uncond = torch.zeros_like(caption_mask_cond)
 
@@ -556,18 +533,10 @@ def prepare_euler_rf_cfg(
                 _bundle(
                     text_state=text_state_uncond if name == "text" else text_state_cond,
                     text_mask=text_mask_uncond if name == "text" else text_mask_cond,
-                    speaker_state=(
-                        speaker_state_uncond if name == "speaker" else speaker_state_cond
-                    ),
-                    speaker_mask=(
-                        speaker_mask_uncond if name == "speaker" else speaker_mask_cond
-                    ),
-                    caption_state=(
-                        caption_state_uncond if name == "caption" else caption_state_cond
-                    ),
-                    caption_mask=(
-                        caption_mask_uncond if name == "caption" else caption_mask_cond
-                    ),
+                    speaker_state=(speaker_state_uncond if name == "speaker" else speaker_state_cond),
+                    speaker_mask=(speaker_mask_uncond if name == "speaker" else speaker_mask_cond),
+                    caption_state=(caption_state_uncond if name == "caption" else caption_state_cond),
+                    caption_mask=(caption_mask_uncond if name == "caption" else caption_mask_cond),
                 )
             )
     cfg_batch_mult = len(independent_bundles)
@@ -690,10 +659,7 @@ def prepare_euler_rf_cfg(
     return IrodoriSamplingState(
         latents=x_t,
         t_schedule=t_schedule,
-        cfg_active=tuple(
-            bool(enabled_cfg_names) and cfg_min_t <= float(t) <= cfg_max_t
-            for t in cfg_active_values
-        ),
+        cfg_active=tuple(bool(enabled_cfg_names) and cfg_min_t <= float(t) <= cfg_max_t for t in cfg_active_values),
         condition=condition,
         cond_bundle=cond_bundle,
         independent_bundle=independent_bundle,
@@ -761,11 +727,7 @@ def predict_euler_rf_cfg_step(
                 x_t=torch.cat([state.latents] * cfg_rows, dim=0).to(model.dtype),
                 t=tt.repeat(cfg_rows),
                 bundle=state.independent_bundle,
-                latent_mask=(
-                    None
-                    if state.latent_mask is None
-                    else torch.cat([state.latent_mask] * cfg_rows, dim=0)
-                ),
+                latent_mask=(None if state.latent_mask is None else torch.cat([state.latent_mask] * cfg_rows, dim=0)),
                 context_kv_cache=state.context_kv_cfg,
             )
             chunks = prediction.chunk(cfg_rows, dim=0)
@@ -906,10 +868,9 @@ def _pack_state_context(
     source_states = (bundle[0], bundle[2], bundle[4])
     source_masks = (bundle[1], bundle[3], bundle[5])
     row_count = bundle[0].shape[0]
-    if any(
-        source is not None and source.shape[0] != row_count
-        for source in source_states
-    ) or any(mask is not None and mask.shape[0] != row_count for mask in source_masks):
+    if any(source is not None and source.shape[0] != row_count for source in source_states) or any(
+        mask is not None and mask.shape[0] != row_count for mask in source_masks
+    ):
         raise ValueError("Packed Irodori context masks have inconsistent row counts.")
 
     row_source_indices: list[list[torch.Tensor]] = []
@@ -952,14 +913,8 @@ def _pack_state_context(
             packed_v_rows.append(torch.cat(row_v, dim=0))
         packed_layers.append(
             (
-                torch.cat(packed_k_rows, dim=0)
-                .unsqueeze(0)
-                .to(dtype=attention_dtype)
-                .contiguous(),
-                torch.cat(packed_v_rows, dim=0)
-                .unsqueeze(0)
-                .to(dtype=attention_dtype)
-                .contiguous(),
+                torch.cat(packed_k_rows, dim=0).unsqueeze(0).to(dtype=attention_dtype).contiguous(),
+                torch.cat(packed_v_rows, dim=0).unsqueeze(0).to(dtype=attention_dtype).contiguous(),
             )
         )
 
@@ -968,25 +923,35 @@ def _pack_state_context(
     return result
 
 
-def _pack_batch_context(
+def packed_context_modes(
+    states: list[IrodoriSamplingState],
+    cfg_refreshes: list[bool],
+) -> list[str]:
+    if len(cfg_refreshes) != len(states):
+        raise ValueError("Packed Irodori CFG refresh flags must align with requests.")
+    return [
+        "cfg" if state.cfg_active[state.step_index] and cfg_refresh else "cond"
+        for state, cfg_refresh in zip(states, cfg_refreshes, strict=True)
+    ]
+
+
+def pack_irodori_batch_context(
     states: list[IrodoriSamplingState],
     *,
-    mode: str,
+    modes: list[str],
     attention_dtype: torch.dtype,
 ) -> PackedContextState:
+    if len(modes) != len(states):
+        raise ValueError("Packed Irodori context modes must align with requests.")
     request_contexts = [
         _pack_state_context(
             state,
             mode=mode,
             attention_dtype=attention_dtype,
         )
-        for state in states
+        for state, mode in zip(states, modes, strict=True)
     ]
-    context_lengths = tuple(
-        length
-        for _, lengths in request_contexts
-        for length in lengths
-    )
+    context_lengths = tuple(length for _, lengths in request_contexts for length in lengths)
     layer_count = len(request_contexts[0][0])
     if any(len(context[0]) != layer_count for context in request_contexts[1:]):
         raise ValueError("Packed Irodori context K/V layer counts differ across requests.")
@@ -1020,11 +985,7 @@ def supports_packed_euler_rf_cfg_batch(
         and all(not state.speaker_kv_active for state in states)
         and all(state.latents.shape[0] == 1 for state in states)
         and all(state.context_kv_cond is not None for state in states)
-        and all(
-            state.context_kv_cfg is not None
-            for state in states
-            if state.cfg_active[state.step_index]
-        )
+        and all(state.context_kv_cfg is not None for state in states if state.cfg_active[state.step_index])
     )
 
 
@@ -1033,34 +994,40 @@ def run_packed_varlen_euler_rf_cfg_step(
     model: TextToLatentRFDiT,
     states: list[IrodoriSamplingState],
     *,
-    cfg_refresh: bool,
+    cfg_refreshes: list[bool],
+    packed_context: PackedContextState | None = None,
 ) -> list[torch.Tensor]:
-    """Run heterogeneous requests as one exact-token varlen DiT batch."""
+    """Run heterogeneous requests as one exact-token varlen DiT batch.
+
+    CFG activity and correction refresh are request-local.  This lets a live
+    continuous batch contain a four-row active-CFG request next to a one-row
+    inactive or correction-reuse request instead of partitioning them into
+    separate DiT forwards.
+    """
     if not supports_packed_euler_rf_cfg_batch(model, states):
         raise ValueError("Irodori states are not eligible for packed varlen execution.")
-    cfg_active = states[0].cfg_active[states[0].step_index]
-    if any(state.cfg_active[state.step_index] != cfg_active for state in states[1:]):
-        raise ValueError("Packed Irodori requests must have matching CFG activity.")
-    if cfg_active and any(
-        state.independent_names != states[0].independent_names
-        for state in states[1:]
-    ):
-        raise ValueError("Packed Irodori requests must have matching CFG layouts.")
-
-    context_mode = "cfg" if cfg_active and cfg_refresh else "cond"
+    cfg_active_values = [state.cfg_active[state.step_index] for state in states]
+    context_modes = packed_context_modes(states, cfg_refreshes)
     attention_dtype = model.packed_attention_dtype
     if attention_dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError("Packed Irodori execution has no supported attention dtype.")
-    context_kv_cache, context_lengths = _pack_batch_context(
-        states,
-        mode=context_mode,
-        attention_dtype=attention_dtype,
-    )
+    if packed_context is None:
+        packed_context = pack_irodori_batch_context(
+            states,
+            modes=context_modes,
+            attention_dtype=attention_dtype,
+        )
+    context_kv_cache, context_lengths = packed_context
     latent_chunks: list[torch.Tensor] = []
     query_lengths: list[int] = []
     timestep_values: list[torch.Tensor] = []
     logical_rows_per_request: list[int] = []
-    for state in states:
+    for state, cfg_active, cfg_refresh in zip(
+        states,
+        cfg_active_values,
+        cfg_refreshes,
+        strict=True,
+    ):
         valid_length = state.valid_latent_lengths[0]
         logical_rows = len(state.independent_names) if cfg_active and cfg_refresh else 1
         logical_rows_per_request.append(logical_rows)
@@ -1088,27 +1055,34 @@ def run_packed_varlen_euler_rf_cfg_step(
 
     next_latents: list[torch.Tensor] = []
     row_offset = 0
-    for state, logical_rows in zip(states, logical_rows_per_request, strict=True):
+    for state, logical_rows, cfg_active, cfg_refresh in zip(
+        states,
+        logical_rows_per_request,
+        cfg_active_values,
+        cfg_refreshes,
+        strict=True,
+    ):
         valid_length = state.valid_latent_lengths[0]
         rows = prediction_rows[row_offset : row_offset + logical_rows]
         row_offset += logical_rows
         conditional = rows[0]
-        if cfg_active and cfg_refresh and logical_rows > 1:
-            correction = torch.zeros_like(conditional)
-            for name, unconditional in zip(
-                state.independent_names[1:],
-                rows[1:],
-                strict=True,
-            ):
-                correction = correction + state.cfg_scales[name] * (
-                    conditional - unconditional
-                )
-            if state.cfg_correction is None:
-                state.cfg_correction = torch.zeros_like(state.latents)
+        if cfg_active and cfg_refresh:
+            if logical_rows > 1:
+                correction = torch.zeros_like(conditional)
+                for name, unconditional in zip(
+                    state.independent_names[1:],
+                    rows[1:],
+                    strict=True,
+                ):
+                    correction = correction + state.cfg_scales[name] * (conditional - unconditional)
+                if state.cfg_correction is None:
+                    state.cfg_correction = torch.zeros_like(state.latents)
+                else:
+                    state.cfg_correction.zero_()
+                state.cfg_correction[:, :valid_length].copy_(correction.unsqueeze(0))
+                velocity = conditional + correction
             else:
-                state.cfg_correction.zero_()
-            state.cfg_correction[:, :valid_length].copy_(correction.unsqueeze(0))
-            velocity = conditional + correction
+                velocity = conditional
         elif cfg_active:
             if state.cfg_correction is None:
                 raise ValueError("Packed Irodori CFG reuse requires a cached correction.")
@@ -1151,14 +1125,9 @@ def predict_euler_rf_cfg_batch(
 
     if cfg_active:
         cfg_rows = states[0].cfg_rows
-        latents = torch.cat(
-            [torch.cat([state.latents] * cfg_rows, dim=0) for state in states], dim=0
-        ).to(model.dtype)
+        latents = torch.cat([torch.cat([state.latents] * cfg_rows, dim=0) for state in states], dim=0).to(model.dtype)
         timesteps = torch.cat(
-            [
-                state.current_timestep.reshape(1).expand(state.latents.shape[0] * cfg_rows)
-                for state in states
-            ]
+            [state.current_timestep.reshape(1).expand(state.latents.shape[0] * cfg_rows) for state in states]
         ).to(device=model.device, dtype=model.dtype)
         latent_mask = _pad_and_cat_optional(
             [
@@ -1187,9 +1156,9 @@ def predict_euler_rf_cfg_batch(
         return result
 
     latents = torch.cat([state.latents for state in states], dim=0).to(model.dtype)
-    timesteps = torch.cat(
-        [state.current_timestep.reshape(1).expand(state.latents.shape[0]) for state in states]
-    ).to(device=model.device, dtype=model.dtype)
+    timesteps = torch.cat([state.current_timestep.reshape(1).expand(state.latents.shape[0]) for state in states]).to(
+        device=model.device, dtype=model.dtype
+    )
     prediction = _forward_with_bundle(
         model,
         x_t=latents,
@@ -1274,9 +1243,7 @@ def run_packed_euler_rf_cfg_step(
             t=batch.timesteps.to(device=model.device, dtype=model.dtype),
             bundle=_conditional_rows(batch.bundle, request_count, len(batch.cfg_layout)),
             latent_mask=batch.latent_mask,
-            context_kv_cache=_conditional_context_kv(
-                batch.context_kv_cache, request_count, len(batch.cfg_layout)
-            ),
+            context_kv_cache=_conditional_context_kv(batch.context_kv_cache, request_count, len(batch.cfg_layout)),
         )
         velocity = conditional + batch.cfg_correction
         next_latents = batch.latents + velocity * batch.dt[:, None, None]
