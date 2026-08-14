@@ -186,4 +186,3 @@ def set_duration_has_speaker_feature(
     out = features.clone()
     out[:, -1] = has_speaker.to(device=features.device, dtype=features.dtype)
     return out
-

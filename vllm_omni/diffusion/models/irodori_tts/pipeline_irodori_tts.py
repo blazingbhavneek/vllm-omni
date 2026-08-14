@@ -146,15 +146,17 @@ class IrodoriTTSPipeline(
                 f"Irodori requires {self.audio_sample_rate} Hz DACVAE output; got {self.codec.sample_rate}."
             )
         self.batching_config = IrodoriBatchingConfig.from_od_config(od_config)
-        # Per-stage precision policy: TF32 for the DiT/codec matmuls, BF16 for
-        # joint attention, strict IEEE FP32 for the condition encoders and the
-        # duration predictor.  See precision.py for why the split exists.
+        # ``self.dtype`` selects model and codec parameter dtype. This policy
+        # separately controls FP32 matmul behavior and the joint-attention
+        # activation dtype; see precision.py.
         self.precision_policy = self.batching_config.precision_policy
         self.model.set_precision_policy(self.precision_policy)
         self.codec.precision_policy = self.precision_policy
         self.packed_varlen_enabled = self.model.supports_packed_varlen_attention()
         logger.info(
-            "Irodori precision profile %r: dit=%s codec=%s condition=%s attention=%s",
+            "Irodori parameter dtype=%s; precision profile %r "
+            "(FP32 matmul policy): dit=%s codec=%s condition=%s attention=%s",
+            self.dtype,
             self.precision_policy.name,
             self.precision_policy.dit_matmul,
             self.precision_policy.codec_matmul,

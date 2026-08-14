@@ -310,8 +310,8 @@ class DACVAECodec:
         if latent.ndim != 3:
             raise ValueError(f"Expected latent ndim=3, got shape={tuple(latent.shape)}")
         z = latent.transpose(1, 2).contiguous().to(self.device, dtype=self.dtype)  # (B, D, T)
-        # The DACVAE decoder is dominated by FP32 convolutions; TF32 moves them
-        # onto tensor cores without changing weights or the output shape.
+        # The policy affects only convolution/matmul operations whose inputs
+        # remain FP32. BF16 codec parameters and activations stay BF16 here.
         with matmul_precision(self._matmul_mode()):
             return self.model.decode(z)
 

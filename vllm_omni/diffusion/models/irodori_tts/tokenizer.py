@@ -140,4 +140,3 @@ class PretrainedTextTokenizer:
         batch[:, 1:] = body_ids
         mask[:, 1:] = body_mask
         return batch, mask
-

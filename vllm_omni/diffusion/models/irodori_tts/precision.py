@@ -11,19 +11,26 @@ Running inference under strict IEEE FP32 therefore evaluates the model in a
 *stricter* numerical regime than it ever saw during training, at roughly half
 the achievable throughput.
 
-This module expresses that as an explicit per-stage policy instead of one
-global dtype, so the stages that must stay bit-stable can, while the heavy
-stages use the datapaths the weights were fitted under.
+The pipeline's ``dtype`` independently selects the parameter dtype for the
+entire model and codec. This module controls only the treatment of operations
+that remain FP32 and the optional joint-attention activation cast. In
+particular, selecting BF16 parameters also makes the condition encoders and
+duration predictor BF16; an ``ieee`` entry below does not cast them back to
+FP32.
 
 ``reference``
-    Everything IEEE FP32.  The frozen parity baseline; keep this runnable.
+    With FP32 parameters, keep all FP32 matmuls in IEEE mode and do not cast
+    joint-attention activations.
 
 ``trained`` (default)
-    TF32 matmuls in the DiT denoise loop and the DACVAE codec, BF16 joint
-    attention inside the DiT, and IEEE FP32 for the condition encoders and the
-    duration predictor.
+    With FP32 parameters, allow TF32 matmuls in the DiT denoise loop and
+    DACVAE codec, cast joint-attention activations to BF16, and keep condition
+    and duration FP32 matmuls in IEEE mode. With BF16 parameters, the TF32/IEEE
+    selections affect only any residual operations that still receive FP32
+    inputs.
 
-The condition/duration carve-out is not cosmetic.  ``_duration_lengths()``
+For FP32 parameters, the condition/duration carve-out is not cosmetic.
+``_duration_lengths()``
 does ``round(expm1(prediction).mean() * duration_scale)``; a rounding flip
 changes the latent shape, hence the noise draw, hence the entire render.  The
 measured TF32 perturbation there is ~0.02 codec frames, which would flip a few

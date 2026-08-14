@@ -200,4 +200,3 @@ def save_speaker_inversion_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     state = speaker_inversion_state_dict(model)
     save_speaker_inversion_safetensors(path, state)
-
