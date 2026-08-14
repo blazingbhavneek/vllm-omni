@@ -79,25 +79,6 @@ def _name_match_candidate(model: str) -> str:
     return model.rstrip("/").rsplit("/", 1)[-1]
 
 
-def _get_local_diffusers_class_name(model: str) -> str | None:
-    """Return a local pipeline index's class name without Transformers parsing."""
-    model_path = Path(model).expanduser()
-    if not model_path.is_dir():
-        return None
-    for filename in ("model_index.json", "modular_model_index.json"):
-        if not (model_path / filename).is_file():
-            continue
-        try:
-            model_index = get_hf_file_to_dict(filename, model, revision=None)
-        except Exception as exc:
-            logger.debug("Failed to read local %s for %s: %s", filename, model, exc)
-            continue
-        class_name = model_index.get("_class_name") if model_index else None
-        if isinstance(class_name, str):
-            return class_name
-    return None
-
-
 def with_trust_remote_code_override(
     overrides: Mapping[str, Any],
     trust_remote_code: bool | None,
@@ -168,11 +149,7 @@ class StageConfigFactory:
         Returns:
             the model's config or None.
         """
-        # A local Diffusers pipeline index is authoritative. Its optional root
-        # config.json may describe a native pipeline rather than a Transformers
-        # architecture, so sending it through get_config produces false errors.
-        if _get_local_diffusers_class_name(model) is not None:
-            return None
+        hf_config = None
         try:
             return get_config(_materialize_object_storage_configs(model), trust_remote_code=trust_remote_code)
         except Exception as e:
@@ -213,19 +190,6 @@ class StageConfigFactory:
         Returns:
             model_type as a string; may be None on failure.
         """
-        local_diffusers_class = _get_local_diffusers_class_name(model)
-        if local_diffusers_class is not None:
-            for obj in OMNI_PIPELINES.values():
-                pipeline_cfg = obj(None) if callable(obj) else obj
-                if pipeline_cfg is not None and pipeline_cfg.diffusers_class_name == local_diffusers_class:
-                    logger.info(
-                        "Detected pipeline %r from local model index (_class_name=%r)",
-                        pipeline_cfg.model_type,
-                        local_diffusers_class,
-                    )
-                    return pipeline_cfg.model_type
-            return local_diffusers_class
-
         hf_config = cls.get_hf_config(
             model=model,
             trust_remote_code=trust_remote_code,

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Hashable
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -82,11 +81,6 @@ class StepBatchSamplingParamsKey:
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
-
-    # Optional model-owned compatibility value. The scheduler treats this as
-    # opaque so each pipeline can protect shape- and CFG-sensitive inputs
-    # without teaching the generic key about model-specific arguments.
-    model_key: Hashable | None = None
 
 
 @dataclass(frozen=True, eq=True)

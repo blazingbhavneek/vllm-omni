@@ -37,7 +37,6 @@ from .batching import (
 )
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import read_irodori_checkpoint_config, resolve_irodori_checkpoint
-from .cudagraph import IrodoriCUDAGraphRunner
 from .duration import build_duration_features
 from .model import TextToLatentRFDiT
 from .sampler import (
@@ -74,85 +73,6 @@ def get_irodori_tts_post_process_func(_od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-@dataclass(frozen=True)
-class IrodoriStepBatchKey:
-    """Request-wide properties that must match in the scheduler active set."""
-
-    num_steps: int
-    cfg_branches: tuple[str, ...]
-    cfg_scale_text: float
-    cfg_scale_caption: float
-    cfg_scale_speaker: float
-    cfg_min_t: float = 0.5
-    cfg_max_t: float = 1.0
-    cfg_schedule: str = "linear"
-    output_type: str = "np"
-
-
-def get_irodori_tts_step_batch_key_func(od_config: OmniDiffusionConfig):
-    """Build scheduler-owned compatibility keys without loading model weights."""
-    del od_config
-
-    def step_batch_key(request: Any) -> IrodoriStepBatchKey:
-        sampling = request.sampling_params
-        extra = dict(getattr(sampling, "extra_args", {}) or {})
-        raw_num_steps = getattr(sampling, "num_inference_steps", None)
-        if raw_num_steps is None:
-            raw_num_steps = extra.get("num_steps", 40)
-        num_steps = IrodoriTTSPipeline._positive_int(
-            raw_num_steps,
-            name="num_steps",
-            minimum=1,
-            maximum=100,
-        )
-        cfg_scale_text = IrodoriTTSPipeline._finite_float(
-            extra.get("cfg_scale_text", 3.0),
-            name="cfg_scale_text",
-            minimum=0.0,
-            maximum=10.0,
-        )
-        cfg_scale_caption = IrodoriTTSPipeline._finite_float(
-            extra.get("cfg_scale_caption", 3.0),
-            name="cfg_scale_caption",
-            minimum=0.0,
-            maximum=10.0,
-        )
-        cfg_scale_speaker = IrodoriTTSPipeline._finite_float(
-            extra.get("cfg_scale_speaker", 5.0),
-            name="cfg_scale_speaker",
-            minimum=0.0,
-            maximum=10.0,
-        )
-        prompt = getattr(request, "prompt", None)
-        caption = ""
-        if isinstance(prompt, dict):
-            caption = prompt.get("caption") or prompt.get("instruct") or ""
-        if not isinstance(caption, str):
-            raise ValueError("Irodori caption must be a string when provided.")
-        cfg_branches = tuple(
-            name
-            for name, enabled in (
-                ("text", cfg_scale_text > 0),
-                ("speaker", cfg_scale_speaker > 0),
-                ("caption", cfg_scale_caption > 0 and bool(caption.strip())),
-            )
-            if enabled
-        )
-        output_type = getattr(sampling, "output_type", None) or "np"
-        if output_type not in {"np", "pt", "latent"}:
-            raise ValueError("Irodori output_type must be one of: np, pt, latent.")
-        return IrodoriStepBatchKey(
-            num_steps=num_steps,
-            cfg_branches=cfg_branches,
-            cfg_scale_text=cfg_scale_text,
-            cfg_scale_caption=cfg_scale_caption,
-            cfg_scale_speaker=cfg_scale_speaker,
-            output_type=output_type,
-        )
-
-    return step_batch_key
-
-
 @dataclass
 class _IrodoriPreparedRequest:
     sampling_state: IrodoriSamplingState
@@ -175,9 +95,7 @@ class IrodoriTTSPipeline(
 
     supports_request_batch: ClassVar[bool] = False
     supports_step_execution: ClassVar[bool] = True
-    supports_step_execution_partition: ClassVar[bool] = True
     supports_fused_step_execution: ClassVar[bool] = True
-    supports_ragged_step_execution: ClassVar[bool] = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 48000
     _dit_modules: ClassVar[list[str]] = ["model"]
@@ -255,25 +173,6 @@ class IrodoriTTSPipeline(
             overflow_bucket_seconds=self.batching_config.overflow_bucket_seconds,
         )
         self.context_bucket_policy = IrodoriContextBucketPolicy(self.batching_config.context_bucket_tokens)
-        graph_enabled = self.batching_config.enable_cuda_graph and not bool(getattr(od_config, "enforce_eager", False))
-        # Keep manual graph capture separate from real torch.compile output.
-        # Irodori's repeated DiT blocks use regional compilation, so the
-        # low-value manual graph path is disabled when that compile is active.
-        compile_granularity = getattr(
-            od_config,
-            "diffusion_compile_granularity",
-            "regional",
-        )
-        regional_compile_is_active = bool(getattr(self.model, "_repeated_blocks", None))
-        if compile_granularity == "full" or regional_compile_is_active:
-            graph_enabled = False
-        self.cuda_graph_runner = IrodoriCUDAGraphRunner(
-            enabled=graph_enabled,
-            batch_sizes=self.batching_config.cuda_graph_batch_sizes,
-            max_entries=self.batching_config.cuda_graph_max_entries,
-            max_dynamic_entries=self.batching_config.cuda_graph_max_dynamic_entries,
-            min_hits=self.batching_config.cuda_graph_min_hits,
-        )
         self._denoise_batches: OrderedDict[IrodoriExecutionKey, IrodoriDenoiseBatch] = OrderedDict()
         self._packed_context_batches: OrderedDict[
             tuple[Any, ...],
@@ -564,7 +463,7 @@ class IrodoriTTSPipeline(
                 num_steps=options["num_steps"],
                 cfg_scale_text=options["cfg_scale_text"],
                 cfg_scale_caption=options["cfg_scale_caption"],
-                cfg_scale_speaker=options["cfg_scale_speaker"],
+                cfg_scale_speaker=options["cfg_scale_speaker"] if has_reference else 0.0,
                 cfg_guidance_mode="independent",
                 cfg_min_t=0.5,
                 cfg_max_t=1.0,
@@ -616,7 +515,12 @@ class IrodoriTTSPipeline(
         state.extra["irodori"] = prepared
         return state
 
-    def get_step_execution_key(self, state: StepRequestState) -> IrodoriExecutionKey:
+    def get_step_execution_key(
+        self,
+        state: StepRequestState,
+        *,
+        packed_varlen: bool | None = None,
+    ) -> IrodoriExecutionKey:
         """Return the post-duration physical microbatch key for one request."""
         prepared = state.extra.get("irodori")
         if not isinstance(prepared, _IrodoriPreparedRequest):
@@ -624,10 +528,11 @@ class IrodoriTTSPipeline(
         sampling_state = prepared.sampling_state
         cfg_active = sampling_state.cfg_active[sampling_state.step_index]
         device = sampling_state.latents.device
-        packed_varlen = supports_packed_euler_rf_cfg_batch(
-            self.model,
-            [sampling_state],
-        )
+        if packed_varlen is None:
+            packed_varlen = self.packed_varlen_enabled and supports_packed_euler_rf_cfg_batch(
+                self.model,
+                [sampling_state],
+            )
         return IrodoriExecutionKey(
             bucket_latent_len=(None if packed_varlen else prepared.lengths.bucket_latent_len),
             dtype=sampling_state.latents.dtype,
@@ -706,14 +611,19 @@ class IrodoriTTSPipeline(
 
     def denoise_and_step(
         self,
-        input_batch: InputBatch,
         *,
         states: list[StepRequestState],
         **_: Any,
     ) -> None:
-        """Run a packed eager/graph step and advance every request exactly once."""
-        if tuple(input_batch.request_ids) != tuple(state.request_id for state in states):
-            raise ValueError("Irodori InputBatch/request ordering diverged.")
+        """Advance every request once, grouping padded fallbacks internally."""
+        groups: dict[IrodoriExecutionKey, list[StepRequestState]] = {}
+        for state in states:
+            groups.setdefault(self.get_step_execution_key(state), []).append(state)
+        for group in groups.values():
+            self._denoise_and_step_group(group)
+
+    def _denoise_and_step_group(self, states: list[StepRequestState]) -> None:
+        """Run one physically compatible packed or padded microbatch."""
 
         prepared_requests: list[_IrodoriPreparedRequest] = []
         for state in states:
@@ -744,7 +654,16 @@ class IrodoriTTSPipeline(
                 state.step_index += 1
             return
 
-        if supports_packed_euler_rf_cfg_batch(self.model, sampling_states):
+        packed_eligible = self.packed_varlen_enabled and supports_packed_euler_rf_cfg_batch(
+            self.model, sampling_states
+        )
+        padded_key = self.get_step_execution_key(states[0], packed_varlen=False)
+        padded_compatible = all(
+            self.get_step_execution_key(state, packed_varlen=False) == padded_key for state in states[1:]
+        )
+        if packed_eligible and not (
+            self.model.packed_attention_backend == "flashinfer" and padded_compatible
+        ):
             execution_key = self.get_step_execution_key(states[0])
             if any(self.get_step_execution_key(state) != execution_key for state in states[1:]):
                 raise ValueError("Irodori packed step received a heterogeneous execution group.")
@@ -783,15 +702,14 @@ class IrodoriTTSPipeline(
                 state.step_index += 1
             return
 
-        execution_key = self.get_step_execution_key(states[0])
-        if any(self.get_step_execution_key(state) != execution_key for state in states[1:]):
+        execution_key = padded_key
+        if not padded_compatible:
             raise ValueError("Irodori fused step received a heterogeneous execution group.")
         cached_batch = self._denoise_batches.get(execution_key)
         denoise_batch = IrodoriDenoiseBatch.make(
             [state.request_id for state in states],
             sampling_states,
             context_policy=self.context_bucket_policy,
-            is_dynamic_latent_bucket=any(prepared.lengths.is_dynamic_bucket for prepared in prepared_requests),
             cached_batch=cached_batch,
             cfg_refresh=execution_key.cfg_refresh,
         )
@@ -801,14 +719,10 @@ class IrodoriTTSPipeline(
         while len(self._denoise_batches) > max_packed_batches:
             self._denoise_batches.popitem(last=False)
 
-        next_latents = self.cuda_graph_runner(
-            self.model,
-            denoise_batch,
-            run_packed_euler_rf_cfg_step,
-        )
+        next_latents = run_packed_euler_rf_cfg_step(self.model, denoise_batch)
         refreshed_correction = denoise_batch.cfg_correction if execution_key.cfg_refresh else None
         for index, (state, sampling_state) in enumerate(zip(states, sampling_states, strict=True)):
-            # Graph outputs are shared fixed buffers, so each request owns a copy.
+            # Keep request state independent from the reusable packed buffers.
             request_latents = next_latents[index : index + 1].clone()
             sampling_state.latents = request_latents
             if refreshed_correction is not None:
@@ -855,15 +769,6 @@ class IrodoriTTSPipeline(
         while len(self._packed_context_batches) > 4:
             self._packed_context_batches.popitem(last=False)
         return packed_context
-
-    def clear_cuda_graphs(self) -> None:
-        self.cuda_graph_runner.clear()
-        self._denoise_batches.clear()
-        self._packed_context_batches.clear()
-        self.model._packed_layout_cache.clear()
-
-    def get_cuda_graph_stats(self) -> dict[str, int]:
-        return self.cuda_graph_runner.stats()
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **_: Any) -> None:
         """Apply one exact Euler update to one request-local latent."""

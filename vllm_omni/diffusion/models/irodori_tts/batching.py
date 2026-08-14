@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 
 DEFAULT_LATENT_BUCKET_SECONDS = tuple(float(seconds) for seconds in range(2, 31, 2))
 DEFAULT_CONTEXT_BUCKET_TOKENS = (8, 16, 32, 64, 128, 256, 512, 1024)
-DEFAULT_CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
-IRODORI_CUDA_GRAPH_ENV = "VLLM_OMNI_IRODORI_CUDA_GRAPH"
 IRODORI_PRECISION_ENV = "VLLM_OMNI_IRODORI_PRECISION"
 IRODORI_FUSED_PROJECTIONS_ENV = "VLLM_OMNI_IRODORI_FUSED_PROJECTIONS"
 
@@ -113,32 +111,10 @@ class IrodoriExecutionKey:
 
 
 @dataclass(frozen=True)
-class IrodoriGraphKey:
-    """Every shape and control-flow choice fixed by a CUDA graph."""
-
-    device_type: str
-    device_index: int | None
-    dtype: torch.dtype
-    request_batch_size: int
-    bucket_latent_len: int
-    text_context_bucket: int
-    speaker_context_bucket: int
-    caption_context_bucket: int
-    cfg_active: bool
-    cfg_layout: tuple[str, ...]
-    cfg_refresh: bool = True
-
-
-@dataclass(frozen=True)
 class IrodoriBatchingConfig:
     latent_bucket_seconds: tuple[float, ...]
     overflow_bucket_seconds: float
     context_bucket_tokens: tuple[int, ...]
-    cuda_graph_batch_sizes: tuple[int, ...]
-    cuda_graph_max_entries: int
-    cuda_graph_max_dynamic_entries: int
-    cuda_graph_min_hits: int
-    enable_cuda_graph: bool
     cfg_refresh_interval: int
     precision_policy: IrodoriPrecisionPolicy
     fuse_linear_projections: bool
@@ -166,23 +142,6 @@ class IrodoriBatchingConfig:
         if any(right <= left for left, right in zip(context_tokens, context_tokens[1:])):
             raise ValueError("irodori_context_bucket_tokens must be strictly increasing.")
 
-        graph_batch_sizes = tuple(
-            _positive_int(value, name="irodori_cuda_graph_batch_sizes")
-            for value in _sequence(
-                extras.get("irodori_cuda_graph_batch_sizes", DEFAULT_CUDA_GRAPH_BATCH_SIZES),
-                name="irodori_cuda_graph_batch_sizes",
-            )
-        )
-        if len(set(graph_batch_sizes)) != len(graph_batch_sizes):
-            raise ValueError("irodori_cuda_graph_batch_sizes must not contain duplicates.")
-
-        if "irodori_enable_cuda_graph" in extras:
-            enable_graph = extras["irodori_enable_cuda_graph"]
-        else:
-            enable_graph = _environment_bool(IRODORI_CUDA_GRAPH_ENV, default=True)
-        if not isinstance(enable_graph, bool):
-            raise ValueError("irodori_enable_cuda_graph must be a boolean.")
-
         if "irodori_fuse_linear_projections" in extras:
             fuse_linear_projections = extras["irodori_fuse_linear_projections"]
             if not isinstance(fuse_linear_projections, bool):
@@ -200,21 +159,6 @@ class IrodoriBatchingConfig:
                 name="irodori_overflow_bucket_seconds",
             ),
             context_bucket_tokens=context_tokens,
-            cuda_graph_batch_sizes=graph_batch_sizes,
-            cuda_graph_max_entries=_positive_int(
-                extras.get("irodori_cuda_graph_max_entries", 8),
-                name="irodori_cuda_graph_max_entries",
-            ),
-            cuda_graph_max_dynamic_entries=_positive_int(
-                extras.get("irodori_cuda_graph_max_dynamic_entries", 0),
-                name="irodori_cuda_graph_max_dynamic_entries",
-                minimum=0,
-            ),
-            cuda_graph_min_hits=_positive_int(
-                extras.get("irodori_cuda_graph_min_hits", 2),
-                name="irodori_cuda_graph_min_hits",
-            ),
-            enable_cuda_graph=enable_graph,
             # Stage ``extras`` is the request/config-level knob.  Keep the
             # environment fallback for process-wide deployments and give it
             # lower precedence than an explicit stage setting.
@@ -418,14 +362,6 @@ def _pack_context_kv(
     return result
 
 
-def _copy_optional_tensor(destination: torch.Tensor | None, source: torch.Tensor | None) -> None:
-    if destination is None and source is None:
-        return
-    if destination is None or source is None or destination.shape != source.shape:
-        raise ValueError("Irodori packed optional tensor layouts differ.")
-    destination.copy_(source)
-
-
 @dataclass
 class IrodoriDenoiseBatch:
     """Reusable fixed-shape inputs for one Irodori denoise-and-update call."""
@@ -441,38 +377,11 @@ class IrodoriDenoiseBatch:
     bundle: ConditionBundle
     context_kv_cache: ContextKVCache | None
     context_buckets: tuple[int, int, int]
-    dynamic_context_buckets: tuple[bool, bool, bool]
-    is_dynamic_latent_bucket: bool
     # On a refresh step the packed step writes the scaled CFG correction here;
     # on a reuse step it reads the correction carried over from the last
     # refresh instead of running the unconditional branches again.
     cfg_refresh: bool = True
     cfg_correction: torch.Tensor | None = None
-
-    @property
-    def graph_key(self) -> IrodoriGraphKey:
-        device = self.latents.device
-        return IrodoriGraphKey(
-            device_type=device.type,
-            device_index=device.index,
-            dtype=self.latents.dtype,
-            request_batch_size=len(self.request_ids),
-            bucket_latent_len=int(self.latents.shape[1]),
-            text_context_bucket=self.context_buckets[0],
-            speaker_context_bucket=self.context_buckets[1],
-            caption_context_bucket=self.context_buckets[2],
-            cfg_active=self.cfg_active,
-            cfg_layout=self.cfg_layout,
-            cfg_refresh=self.cfg_refresh,
-        )
-
-    @property
-    def is_dynamic_graph_shape(self) -> bool:
-        return self.is_dynamic_latent_bucket or any(self.dynamic_context_buckets)
-
-    @property
-    def composition_key(self) -> tuple[str, ...]:
-        return self.request_ids
 
     @classmethod
     def make(
@@ -481,7 +390,6 @@ class IrodoriDenoiseBatch:
         states: Sequence[IrodoriSamplingState],
         *,
         context_policy: IrodoriContextBucketPolicy,
-        is_dynamic_latent_bucket: bool,
         cached_batch: IrodoriDenoiseBatch | None = None,
         cfg_refresh: bool = True,
     ) -> IrodoriDenoiseBatch:
@@ -510,8 +418,6 @@ class IrodoriDenoiseBatch:
             policy=context_policy,
         )
         context_buckets = (text_bucket[0], speaker_bucket[0], caption_bucket[0])
-        dynamic_context = (text_bucket[1], speaker_bucket[1], caption_bucket[1])
-
         latents = torch.cat([state.latents for state in states], dim=0)
         masks = [
             state.latent_mask
@@ -588,68 +494,6 @@ class IrodoriDenoiseBatch:
             bundle=_pack_bundles(bundles, context_buckets),
             context_kv_cache=_pack_context_kv(states, caches, context_buckets),
             context_buckets=context_buckets,
-            dynamic_context_buckets=dynamic_context,
-            is_dynamic_latent_bucket=bool(is_dynamic_latent_bucket),
             cfg_refresh=bool(cfg_refresh),
             cfg_correction=None if cfg_correction is None else cfg_correction.contiguous(),
         )
-
-    def clone(self) -> IrodoriDenoiseBatch:
-        return IrodoriDenoiseBatch(
-            request_ids=self.request_ids,
-            cfg_active=self.cfg_active,
-            cfg_layout=self.cfg_layout,
-            latents=self.latents.clone(),
-            latent_mask=self.latent_mask.clone(),
-            timesteps=self.timesteps.clone(),
-            dt=self.dt.clone(),
-            cfg_scales=self.cfg_scales.clone(),
-            bundle=tuple(None if value is None else value.clone() for value in self.bundle),
-            context_kv_cache=(
-                None
-                if self.context_kv_cache is None
-                else [tuple(value.clone() for value in layer) for layer in self.context_kv_cache]
-            ),
-            context_buckets=self.context_buckets,
-            dynamic_context_buckets=self.dynamic_context_buckets,
-            is_dynamic_latent_bucket=self.is_dynamic_latent_bucket,
-            cfg_refresh=self.cfg_refresh,
-            cfg_correction=None if self.cfg_correction is None else self.cfg_correction.clone(),
-        )
-
-    def copy_dynamic_from(self, source: IrodoriDenoiseBatch) -> None:
-        self.latents.copy_(source.latents)
-        self.latent_mask.copy_(source.latent_mask)
-        self.timesteps.copy_(source.timesteps)
-        self.dt.copy_(source.dt)
-        self.cfg_scales.copy_(source.cfg_scales)
-        _copy_optional_tensor(self.cfg_correction, source.cfg_correction)
-
-    def copy_static_from(self, source: IrodoriDenoiseBatch) -> None:
-        for destination, value in zip(self.bundle, source.bundle, strict=True):
-            _copy_optional_tensor(destination, value)
-        if self.context_kv_cache is None and source.context_kv_cache is None:
-            return
-        if self.context_kv_cache is None or source.context_kv_cache is None:
-            raise ValueError("Irodori packed context K/V cache layouts differ.")
-        for destination_layer, source_layer in zip(
-            self.context_kv_cache,
-            source.context_kv_cache,
-            strict=True,
-        ):
-            for destination, value in zip(destination_layer, source_layer, strict=True):
-                destination.copy_(value)
-
-    def tensor_bytes(self) -> int:
-        tensors = [
-            self.latents,
-            self.latent_mask,
-            self.timesteps,
-            self.dt,
-            self.cfg_scales,
-            *(value for value in (self.cfg_correction,) if value is not None),
-            *(value for value in self.bundle if value is not None),
-        ]
-        if self.context_kv_cache is not None:
-            tensors.extend(value for layer in self.context_kv_cache for value in layer)
-        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)

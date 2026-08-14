@@ -352,37 +352,6 @@ def _prepare_latents(
     )
 
 
-def _prepare_ragged_latents(
-    states: Sequence[StepRequestState],
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build a zero-copy sentinel for a pipeline that owns ragged packing."""
-    values = [_require_state_latents(state, for_field="ragged latents") for state in states]
-    first = values[0]
-    if first.ndim < 2:
-        raise ValueError("Ragged diffusion latents must have a sequence dimension.")
-    if any(
-        value.dtype != first.dtype
-        or value.device != first.device
-        or value.ndim != first.ndim
-        or value.shape[2:] != first.shape[2:]
-        for value in values[1:]
-    ):
-        raise ValueError("Ragged diffusion latents must match outside the sequence dimension.")
-    if (
-        out is not None
-        and out.numel() == 0
-        and out.dtype == first.dtype
-        and out.device == first.device
-    ):
-        return out
-    # The pipeline reads request-local state tensors directly and writes them
-    # back itself.  Materializing a max-length metadata tensor here would
-    # reintroduce the very padding/copy cost the packed model path removes.
-    return first.new_empty((0,))
-
-
 def _require_state_latents(
     state: StepRequestState,
     *,
@@ -651,7 +620,6 @@ class InputBatch:
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
     states: Sequence[StepRequestState] = field(default_factory=tuple)
-    ragged_latents: bool = False
 
     # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
     # Keep a snapshot of the current per-request versions of prompt embeddings for later runtime comparison
@@ -669,8 +637,7 @@ class InputBatch:
         self,
         selected_states: Sequence[StepRequestState],
     ) -> None:
-        prepare_latents = _prepare_ragged_latents if self.ragged_latents else _prepare_latents
-        self.latents = prepare_latents(selected_states, out=self.latents)
+        self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
 
     def _refresh_static_fields(
@@ -713,7 +680,6 @@ class InputBatch:
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         request_ids: list[str],
-        ragged_latents: bool,
     ) -> InputBatch:
         self.request_ids = request_ids
         self.num_reqs = len(request_ids)
@@ -721,9 +687,7 @@ class InputBatch:
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
         self.states = tuple(selected_states)
-        self.ragged_latents = ragged_latents
-        prepare_latents = _prepare_ragged_latents if ragged_latents else _prepare_latents
-        self.latents = prepare_latents(selected_states, out=self.latents)
+        self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
         self._refresh_static_fields(selected_states)
         self.__post_init__()
@@ -735,17 +699,12 @@ class InputBatch:
         states: Sequence[StepRequestState],
         idx_mapping: torch.Tensor | None = None,
         cached_batch: InputBatch | None = None,
-        allow_ragged_latents: bool = False,
     ) -> InputBatch:
         """Build a temporary step-local batch view from request states."""
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
         request_ids = _prepare_request_ids(selected_states)
 
-        if (
-            _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states)
-            and cached_batch is not None
-            and cached_batch.ragged_latents == allow_ragged_latents
-        ):
+        if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states):
             assert cached_batch is not None
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
@@ -756,7 +715,6 @@ class InputBatch:
                 idx_mapping,
                 idx_mapping_np,
                 request_ids,
-                allow_ragged_latents,
             )
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
@@ -768,11 +726,7 @@ class InputBatch:
             num_reqs_after_padding=len(selected_states),
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
-            latents=(
-                _prepare_ragged_latents(selected_states)
-                if allow_ragged_latents
-                else _prepare_latents(selected_states)
-            ),
+            latents=_prepare_latents(selected_states),
             timesteps=_prepare_timesteps(selected_states),
             guidance=_prepare_guidance(selected_states),
             do_true_cfg=do_true_cfg,
@@ -790,7 +744,6 @@ class InputBatch:
                 "negative_txt_seq_lens",
             ),
             states=tuple(selected_states),
-            ragged_latents=allow_ragged_latents,
             _prompt_update_versions=prompt_update_versions(selected_states),
         )
 

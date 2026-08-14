@@ -16,11 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    flash_attn_varlen_func,
-)
-
 from .config import ModelConfig
+from .packed_attention import resolve_packed_attention_backend, run_packed_attention
 from .precision import (
     IEEE as IEEE_MATMUL,
 )
@@ -294,6 +291,7 @@ class JointAttention(nn.Module):
         # ``None`` keeps upstream's exact SDPA behavior.  Resolved to a plain
         # dtype so the compiled region has no untraceable hardware queries.
         self.attention_dtype: torch.dtype | None = None
+        self.packed_attention_backend: str | None = None
 
     def _apply_rotary_half(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         x_rot, x_passthrough = x.chunk(2, dim=-2)
@@ -366,8 +364,8 @@ class JointAttention(nn.Module):
         documents and isolated by FlashAttention's cumulative sequence
         boundaries.  No latent or context padding participates in the DiT.
         """
-        if flash_attn_varlen_func is None:
-            raise RuntimeError("Packed Irodori attention requires a varlen FlashAttention kernel.")
+        if self.packed_attention_backend is None:
+            raise RuntimeError("Packed Irodori attention requires a supported optimized kernel.")
         if x.shape[0] != 1:
             raise ValueError("Packed Irodori attention expects physical batch size 1.")
 
@@ -398,7 +396,8 @@ class JointAttention(nn.Module):
         key.index_copy_(1, context_kv_indices, context_k)
         value.index_copy_(1, context_kv_indices, context_v)
 
-        y = flash_attn_varlen_func(
+        y = run_packed_attention(
+            self.packed_attention_backend,
             q=q.flatten(0, 1),
             k=key.flatten(0, 1),
             v=value.flatten(0, 1),
@@ -406,11 +405,8 @@ class JointAttention(nn.Module):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            causal=False,
             softmax_scale=self.head_dim**-0.5,
         )
-        if isinstance(y, tuple):
-            y = y[0]
         y = y.reshape(1, packed_len, self.dim).to(output_dtype)
         y = y * torch.sigmoid(gate)
         return self.wo(y)
@@ -1908,9 +1904,11 @@ class TextToLatentRFDiT(nn.Module):
         self.precision_policy = policy
         attention_dtype = supported_attention_dtype(policy)
         self.packed_attention_dtype = attention_dtype
+        self.packed_attention_backend = resolve_packed_attention_backend(self.device, attention_dtype)
         for module in self.modules():
             if isinstance(module, JointAttention):
                 module.attention_dtype = attention_dtype
+                module.packed_attention_backend = self.packed_attention_backend
 
     def fuse_linear_projections_for_inference(self) -> tuple[int, int]:
         """Fuse same-input DiT projections after checkpoint loading.
@@ -1933,7 +1931,7 @@ class TextToLatentRFDiT(nn.Module):
         return (
             self.device.type == "cuda"
             and attention_dtype in (torch.bfloat16, torch.float16)
-            and flash_attn_varlen_func is not None
+            and self.packed_attention_backend is not None
         )
 
     def _stage_matmul_mode(self, stage: str) -> str:

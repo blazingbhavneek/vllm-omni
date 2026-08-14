@@ -13,7 +13,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Sequence
+    from collections.abc import Sequence
 
     import torch
 
@@ -105,53 +105,6 @@ def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
     return isinstance(pipeline, SupportsStepExecution)
-
-
-@runtime_checkable
-class SupportsStepExecutionPartition(Protocol):
-    """Optional worker-side partitioning after request preparation."""
-
-    supports_step_execution_partition: ClassVar[bool] = True
-
-    def get_step_execution_key(self, state: StepRequestState) -> Hashable:
-        """Return the physical microbatch key for the state's next step."""
-        ...
-
-
-def supports_step_execution_partition(pipeline: object) -> bool:
-    return isinstance(pipeline, SupportsStepExecutionPartition)
-
-
-@runtime_checkable
-class SupportsRaggedStepExecution(Protocol):
-    """Optional protocol for pipelines whose request latents may differ in shape."""
-
-    supports_ragged_step_execution: ClassVar[bool] = True
-
-
-def supports_ragged_step_execution(pipeline: object) -> bool:
-    return isinstance(pipeline, SupportsRaggedStepExecution)
-
-
-@runtime_checkable
-class SupportsFusedStepExecution(Protocol):
-    """Optional protocol for pipelines that apply denoise and update together."""
-
-    supports_fused_step_execution: ClassVar[bool] = True
-
-    def denoise_and_step(
-        self,
-        input_batch: InputBatch,
-        *,
-        states: Sequence[StepRequestState],
-        **kwargs: Any,
-    ) -> None:
-        """Advance every state in one homogeneous physical microbatch once."""
-        ...
-
-
-def supports_fused_step_execution(pipeline: object) -> bool:
-    return isinstance(pipeline, SupportsFusedStepExecution)
 
 
 @runtime_checkable

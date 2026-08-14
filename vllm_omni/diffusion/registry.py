@@ -373,8 +373,6 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
-    # Irodori uses request-scoped static condition K/V. Cache-DiT/TeaCache
-    # correctness has not yet been established for this architecture.
     "IrodoriTTSPipeline",
 }
 
@@ -647,11 +645,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
 }
 
-_DIFFUSION_STEP_BATCH_KEY_FUNCS = {
-    # arch: function returning a request -> hashable compatibility-key builder
-    "IrodoriTTSPipeline": "get_irodori_tts_step_batch_key_func",
-}
-
 
 def register_diffusion_model(
     model_arch: str,
@@ -661,7 +654,6 @@ def register_diffusion_model(
     post_process_func_name: str | None = None,
     ir_op_priority_func_name: str | None = None,
     action_post_process_func_name: str | None = None,
-    step_batch_key_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -683,8 +675,6 @@ def register_diffusion_model(
         ir_op_priority_func_name: Optional name of the IR op priority merge
             function located in *module_name*. Pass ``None`` to keep the
             existing entry when replacing a built-in model.
-        step_batch_key_func_name: Optional name of a function that returns a
-            model-specific step-batch compatibility-key builder.
         action_post_process_func_name: Deprecated compatibility-only keyword
             for out-of-tree plugins. Action postprocess hooks are no longer
             registered separately; move action handling into
@@ -717,8 +707,6 @@ def register_diffusion_model(
         _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
     if ir_op_priority_func_name is not None:
         _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
-    if step_batch_key_func_name is not None:
-        _DIFFUSION_STEP_BATCH_KEY_FUNCS[model_arch] = step_batch_key_func_name
 
     logger.info(
         "Registered diffusion model %s -> %s.%s",
@@ -761,12 +749,4 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_PRE_PROCESS_FUNCS:
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
-    return _load_process_func(od_config, func_name)
-
-
-def get_diffusion_step_batch_key_func(od_config: OmniDiffusionConfig):
-    """Return a model-specific step-batch compatibility-key builder, if any."""
-    if od_config.model_class_name not in _DIFFUSION_STEP_BATCH_KEY_FUNCS:
-        return None
-    func_name = _DIFFUSION_STEP_BATCH_KEY_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
