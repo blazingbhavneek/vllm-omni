@@ -328,7 +328,7 @@ class IrodoriTTSPipeline(
     def _sampling_options(self, sampling: Any) -> dict[str, Any]:
         extra = dict(getattr(sampling, "extra_args", {}) or {})
         # DiffusionEngine's generic startup warmup disables image/text CFG with
-        # these two Bagel-shaped defaults. They have no Irodori meaning; drop
+        # these two generic diffusion defaults. They have no Irodori meaning; drop
         # only the exact pair so real unsupported user options still fail.
         warmup_cfg_defaults = {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}
         if all(extra.get(name) == value for name, value in warmup_cfg_defaults.items()):

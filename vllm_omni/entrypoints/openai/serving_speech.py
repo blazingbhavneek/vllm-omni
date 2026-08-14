@@ -500,7 +500,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
         if self._diffusion_mode:
-            return None
+            return self._adapter
 
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
