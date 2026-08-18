@@ -95,10 +95,7 @@ def resolve_precision_policy(profile: object) -> IrodoriPrecisionPolicy:
     if isinstance(profile, IrodoriPrecisionPolicy):
         return profile
     if not isinstance(profile, str) or profile not in PRECISION_PROFILES:
-        raise ValueError(
-            "irodori_precision_profile must be one of "
-            f"{sorted(PRECISION_PROFILES)}, got {profile!r}."
-        )
+        raise ValueError(f"irodori_precision_profile must be one of {sorted(PRECISION_PROFILES)}, got {profile!r}.")
     return PRECISION_PROFILES[profile]
 
 

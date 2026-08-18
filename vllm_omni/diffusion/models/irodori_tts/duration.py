@@ -135,9 +135,7 @@ def build_duration_features(
         raise ValueError(f"max_text_len must be > 0, got {max_text_len}")
 
     rows: list[list[float]] = []
-    for text, token_count, speaker_available in zip(
-        text_list, token_count_list, has_speaker_list, strict=True
-    ):
+    for text, token_count, speaker_available in zip(text_list, token_count_list, has_speaker_list, strict=True):
         char_count = max(len(text), 1)
         kana_count = sum(1 for ch in text if _is_kana(ch))
         kanji_count = sum(1 for ch in text if _is_kanji(ch))
@@ -180,9 +178,7 @@ def set_duration_has_speaker_feature(
     if features.ndim != 2:
         raise ValueError(f"Expected duration features shape (B, D), got {tuple(features.shape)}")
     if features.shape[1] <= 0:
-        raise ValueError(
-            f"duration features must have at least one column, got {features.shape[1]}"
-        )
+        raise ValueError(f"duration features must have at least one column, got {features.shape[1]}")
     out = features.clone()
     out[:, -1] = has_speaker.to(device=features.device, dtype=features.dtype)
     return out

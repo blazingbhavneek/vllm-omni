@@ -112,7 +112,7 @@ def _run_flashinfer_ragged(
 ) -> torch.Tensor:
     device_index = q.device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.accelerator.current_device_index()
     runner = _FLASHINFER_RUNNERS.get(device_index)
     if runner is None:
         runner = _FlashInferRaggedRunner(q.device)

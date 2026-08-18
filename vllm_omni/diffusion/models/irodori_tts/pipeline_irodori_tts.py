@@ -656,16 +656,12 @@ class IrodoriTTSPipeline(
                 state.step_index += 1
             return
 
-        packed_eligible = self.packed_varlen_enabled and supports_packed_euler_rf_cfg_batch(
-            self.model, sampling_states
-        )
+        packed_eligible = self.packed_varlen_enabled and supports_packed_euler_rf_cfg_batch(self.model, sampling_states)
         padded_key = self.get_step_execution_key(states[0], packed_varlen=False)
         padded_compatible = all(
             self.get_step_execution_key(state, packed_varlen=False) == padded_key for state in states[1:]
         )
-        if packed_eligible and not (
-            self.model.packed_attention_backend == "flashinfer" and padded_compatible
-        ):
+        if packed_eligible and not (self.model.packed_attention_backend == "flashinfer" and padded_compatible):
             execution_key = self.get_step_execution_key(states[0])
             if any(self.get_step_execution_key(state) != execution_key for state in states[1:]):
                 raise ValueError("Irodori packed step received a heterogeneous execution group.")

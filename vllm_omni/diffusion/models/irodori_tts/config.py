@@ -151,8 +151,7 @@ def resolve_irodori_checkpoint(model_or_path: str, revision: str | None = None) 
             checkpoint = source
             if checkpoint.name != "model.safetensors":
                 raise ValueError(
-                    "Irodori local checkpoint files must be named 'model.safetensors'; "
-                    f"got {checkpoint.name!r}."
+                    f"Irodori local checkpoint files must be named 'model.safetensors'; got {checkpoint.name!r}."
                 )
         if not checkpoint.is_file():
             raise ValueError(f"Irodori checkpoint not found: {checkpoint}")
@@ -207,21 +206,31 @@ def _split_flat_checkpoint_config(path: Path, flat_config: dict[str, Any]) -> tu
     return (
         model_config,
         _read_positive_int(inference_config.get("max_text_len", 256), name="max_text_len", path=path),
-        _read_positive_int(
-            inference_config.get("max_caption_len", 512), name="max_caption_len", path=path
-        ),
-        _read_positive_float(
-            inference_config.get("ref_max_seconds", 30.0), name="ref_max_seconds", path=path
-        ),
+        _read_positive_int(inference_config.get("max_caption_len", 512), name="max_caption_len", path=path),
+        _read_positive_float(inference_config.get("ref_max_seconds", 30.0), name="ref_max_seconds", path=path),
     )
 
 
 def _validate_model_config(config: ModelConfig, *, path: Path) -> None:
     positive_ints = (
-        "latent_dim", "latent_patch_size", "model_dim", "num_layers", "num_heads",
-        "text_dim", "text_layers", "text_heads", "speaker_dim", "speaker_layers",
-        "speaker_heads", "speaker_patch_size", "timestep_embed_dim", "adaln_rank",
-        "duration_aux_dim", "duration_hidden_dim", "duration_layers", "duration_attention_heads",
+        "latent_dim",
+        "latent_patch_size",
+        "model_dim",
+        "num_layers",
+        "num_heads",
+        "text_dim",
+        "text_layers",
+        "text_heads",
+        "speaker_dim",
+        "speaker_layers",
+        "speaker_heads",
+        "speaker_patch_size",
+        "timestep_embed_dim",
+        "adaln_rank",
+        "duration_aux_dim",
+        "duration_hidden_dim",
+        "duration_layers",
+        "duration_attention_heads",
     )
     for name in positive_ints:
         _read_positive_int(getattr(config, name), name=name, path=path)

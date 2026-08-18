@@ -76,10 +76,7 @@ def check_parity(generated: np.ndarray, sample_rate: int, args: argparse.Namespa
             f"Parity shape mismatch: generated={generated.shape}@{sample_rate}, "
             f"baseline={baseline.shape}@{baseline_rate}."
         )
-    relative_rmse = float(
-        np.sqrt(np.mean((generated - baseline) ** 2))
-        / max(np.sqrt(np.mean(baseline**2)), 1e-8)
-    )
+    relative_rmse = float(np.sqrt(np.mean((generated - baseline) ** 2)) / max(np.sqrt(np.mean(baseline**2)), 1e-8))
     generated_centered = generated - generated.mean()
     baseline_centered = baseline - baseline.mean()
     correlation = float(

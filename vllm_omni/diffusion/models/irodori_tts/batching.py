@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .precision import (
-    IrodoriPrecisionPolicy,
     TRAINED_POLICY,
+    IrodoriPrecisionPolicy,
     resolve_precision_policy,
 )
 
@@ -37,9 +37,7 @@ def _environment_bool(name: str, *, default: bool) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(
-        f"{name} must be one of 1/0, true/false, yes/no, or on/off; got {value!r}."
-    )
+    raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off; got {value!r}.")
 
 
 def _positive_int(value: Any, *, name: str, minimum: int = 1) -> int:
@@ -447,9 +445,7 @@ class IrodoriDenoiseBatch:
                 if state.cfg_correction is None
             ]
             if missing:
-                raise ValueError(
-                    f"Irodori CFG reuse step is missing a cached correction for: {missing}."
-                )
+                raise ValueError(f"Irodori CFG reuse step is missing a cached correction for: {missing}.")
             cfg_correction = torch.cat(
                 [state.cfg_correction for state in states],  # type: ignore[misc]
                 dim=0,

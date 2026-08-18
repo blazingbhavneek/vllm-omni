@@ -73,10 +73,7 @@ class DACVAECodec:
             from dacvae import DACVAE
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
-            raise RuntimeError(
-                "Irodori-TTS requires the 'irodori-tts' extra. "
-                "Install vllm-omni[irodori-tts]."
-            ) from exc
+            raise RuntimeError("Irodori-TTS requires the 'irodori-tts' extra. Install vllm-omni[irodori-tts].") from exc
 
         location = str(repo_id).strip()
         if location.startswith("hf://"):
@@ -163,9 +160,7 @@ class DACVAECodec:
         wm_model.random_message = _fixed_message
 
     @staticmethod
-    def _normalize_loudness(
-        wav: torch.Tensor, sample_rate: int, target_db: float | None
-    ) -> torch.Tensor:
+    def _normalize_loudness(wav: torch.Tensor, sample_rate: int, target_db: float | None) -> torch.Tensor:
         if target_db is None:
             return wav
         wav_device = wav.device
@@ -187,8 +182,7 @@ class DACVAECodec:
             from audiotools import AudioSignal
         except Exception as exc:
             raise RuntimeError(
-                "audiotools is required when normalize_db is set. "
-                "Install audiotools or disable normalize_db."
+                "audiotools is required when normalize_db is set. Install audiotools or disable normalize_db."
             ) from exc
 
         signal = AudioSignal(wav.unsqueeze(0).unsqueeze(0), int(sample_rate))
@@ -201,8 +195,7 @@ class DACVAECodec:
         normalized = normalized.squeeze()
         if normalized.ndim != 1:
             raise RuntimeError(
-                "audiotools normalization returned an unexpected waveform shape "
-                f"{tuple(normalized.shape)}"
+                f"audiotools normalization returned an unexpected waveform shape {tuple(normalized.shape)}"
             )
         return normalized
 
@@ -235,8 +228,7 @@ class DACVAECodec:
                 import torchaudio
             except ImportError as exc:
                 raise RuntimeError(
-                    "Irodori-TTS requires the 'irodori-tts' extra. "
-                    "Install vllm-omni[irodori-tts]."
+                    "Irodori-TTS requires the 'irodori-tts' extra. Install vllm-omni[irodori-tts]."
                 ) from exc
             waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
 
@@ -248,9 +240,7 @@ class DACVAECodec:
             effective_normalize_db = float(normalize_db)
         # audiotools normalization already applies ensure_max_of_audio(), so codec-side
         # peak scaling is only needed when normalization is disabled.
-        effective_ensure_max = (
-            effective_normalize_db is None and bool(ensure_max) if ensure_max is not None else False
-        )
+        effective_ensure_max = effective_normalize_db is None and bool(ensure_max) if ensure_max is not None else False
 
         waveform = waveform.to(dtype=torch.float32)
         if effective_normalize_db is not None or effective_ensure_max:
@@ -258,14 +248,11 @@ class DACVAECodec:
             processed: list[torch.Tensor] = []
             for wav in waveform.squeeze(1):
                 if effective_normalize_db is not None:
-                    wav = self._normalize_loudness(
-                        wav, sample_rate=self.sample_rate, target_db=effective_normalize_db
-                    )
+                    wav = self._normalize_loudness(wav, sample_rate=self.sample_rate, target_db=effective_normalize_db)
                 wav = wav.squeeze()
                 if wav.ndim != 1:
                     raise RuntimeError(
-                        "Expected mono per-item waveform after preprocessing, "
-                        f"got shape={tuple(wav.shape)}"
+                        f"Expected mono per-item waveform after preprocessing, got shape={tuple(wav.shape)}"
                     )
                 if effective_ensure_max:
                     peak = wav.abs().max()
@@ -289,9 +276,7 @@ class DACVAECodec:
                 and hasattr(self.model.quantizer, "in_proj")
             )
             if not required_paths_present:
-                raise RuntimeError(
-                    "deterministic_encode=True requires encoder/_pad/quantizer.in_proj on DACVAE model."
-                )
+                raise RuntimeError("deterministic_encode=True requires encoder/_pad/quantizer.in_proj on DACVAE model.")
             z = self.model.encoder(self.model._pad(waveform))
             mean, _scale = self.model.quantizer.in_proj(z).chunk(2, dim=1)
             encoded = mean

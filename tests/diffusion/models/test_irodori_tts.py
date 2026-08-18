@@ -31,10 +31,7 @@ def test_sm120_unsafe_fa4_uses_flashinfer(monkeypatch):
     monkeypatch.setattr(packed_attention, "flash_attn_varlen_func", lambda: None)
     monkeypatch.setattr(packed_attention, "_has_unsafe_sm120_fa4", lambda _device: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
-    assert (
-        packed_attention.resolve_packed_attention_backend(torch.device("cuda"), torch.bfloat16)
-        == "flashinfer"
-    )
+    assert packed_attention.resolve_packed_attention_backend(torch.device("cuda"), torch.bfloat16) == "flashinfer"
 
 
 def test_supported_flash_attention_remains_preferred(monkeypatch):
@@ -42,10 +39,7 @@ def test_supported_flash_attention_remains_preferred(monkeypatch):
     monkeypatch.setattr(packed_attention, "flash_attn_varlen_func", lambda: None)
     monkeypatch.setattr(packed_attention, "_has_unsafe_sm120_fa4", lambda _device: False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
-    assert (
-        packed_attention.resolve_packed_attention_backend(torch.device("cuda"), torch.bfloat16)
-        == "flash-attn"
-    )
+    assert packed_attention.resolve_packed_attention_backend(torch.device("cuda"), torch.bfloat16) == "flash-attn"
 
 
 def test_checkpoint_metadata_and_precision_contract(tmp_path):

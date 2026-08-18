@@ -412,9 +412,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._adapter = None
         adapter_cls = resolve_adapter(instance._tts_model_type)
         if adapter_cls is not None:
-            instance._adapter = adapter_cls(
-                SpeechServingContext(server=instance, diffusion_engine=diffusion_engine)
-            )
+            instance._adapter = adapter_cls(SpeechServingContext(server=instance, diffusion_engine=diffusion_engine))
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -1881,9 +1879,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         resolved = []
         for ref_audio in ref_audio_list:
             resolved.append(
-                await self._resolve_ref_audio(
-                    ref_audio, min_duration=min_duration, max_duration=max_duration
-                )
+                await self._resolve_ref_audio(ref_audio, min_duration=min_duration, max_duration=max_duration)
             )
         return resolved
 
@@ -3308,8 +3304,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             has_inline_ref_audio = request.ref_audio is not None
             sampling_params_list = copy.deepcopy(self._diffusion_engine.default_sampling_params_list)
             prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
-            sampling_params_list = adapter.apply_sampling_overrides(sampling_params_list, request)
-            if request.seed is not None and sampling_params_list and getattr(sampling_params_list[0], "seed", None) is None:
+            sampling_params_list = adapter.apply_sampling_overrides(
+                sampling_params_list, request, prepared.prompt, request_id
+            )
+            if (
+                request.seed is not None
+                and sampling_params_list
+                and getattr(sampling_params_list[0], "seed", None) is None
+            ):
                 sampling_params_list[0].seed = request.seed
 
             logger.info(
@@ -3334,7 +3336,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("TTS model did not produce audio output.")
             audio_tensor = audio_output[audio_key]
             sample_rate_raw = audio_output.get("audio_sample_rate", audio_output.get("sr", 48000))
-            sample_rate_raw = sample_rate_raw[-1] if isinstance(sample_rate_raw, list) and sample_rate_raw else sample_rate_raw
+            if isinstance(sample_rate_raw, list) and sample_rate_raw:
+                sample_rate_raw = sample_rate_raw[-1]
             sample_rate = int(sample_rate_raw.item()) if hasattr(sample_rate_raw, "item") else int(sample_rate_raw)
             if isinstance(audio_tensor, list):
                 chunks = [chunk for chunk in audio_tensor if hasattr(chunk, "numel") and chunk.numel() > 0]

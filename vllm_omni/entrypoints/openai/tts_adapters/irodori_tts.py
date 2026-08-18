@@ -59,7 +59,7 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
             return f"extra_params.{key} must be an integer in [{int(minimum)}, {int(maximum)}]."
         return None
 
-    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not isinstance(request.input, str) or not request.input.strip():
             return "Input text cannot be empty."
         if request.is_streaming() or request.word_timestamps:
@@ -108,7 +108,7 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
 
     async def build(
         self,
-        request: "OpenAICreateSpeechRequest",
+        request: OpenAICreateSpeechRequest,
         sampling_params_list: list,
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
@@ -118,16 +118,20 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
         if refs is not None:
             ref_list = [refs] if isinstance(refs, str) else refs
             assert isinstance(ref_list, list)  # validated above
-            resolved = await self.ctx.server._resolve_ref_audio_many(
-                ref_list, min_duration=1.0, max_duration=120.0
-            )
+            resolved = await self.ctx.server._resolve_ref_audio_many(ref_list, min_duration=1.0, max_duration=120.0)
             total_duration = sum(len(wav) / sr for wav, sr in resolved)
             if total_duration > 120.0:
                 raise ValueError("Combined Irodori-TTS reference audio must be at most 120 seconds.")
             prompt["ref_audio"] = [(np.asarray(wav, dtype=np.float32), sr) for wav, sr in resolved]
         return PreparedRequest(prompt=prompt, model_type=self.name)
 
-    def apply_sampling_overrides(self, sampling_params_list: list, request: "OpenAICreateSpeechRequest") -> list:
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: OpenAICreateSpeechRequest,
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
         if not sampling_params_list:
             raise ValueError("Irodori-TTS requires a diffusion sampling-parameter stage.")
         result = copy.deepcopy(sampling_params_list)
@@ -139,7 +143,5 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
             params.seed = int(request.seed)
         elif "seed" in extras:
             params.seed = int(extras.pop("seed"))
-        params.extra_args = {
-            key: value for key, value in extras.items() if key in _FORWARDED_EXTRAS
-        }
+        params.extra_args = {key: value for key, value in extras.items() if key in _FORWARDED_EXTRAS}
         return result
