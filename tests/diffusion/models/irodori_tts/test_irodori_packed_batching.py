@@ -7,7 +7,7 @@ batch issues a single fused forward. These tests check the stronger property
 the batching path actually depends on: request ``i``'s result inside an
 N-request batch equals the result it gets on its own, with per-request latents,
 valid lengths, timesteps, step sizes, and CFG scales all differing. That is
-what catches a packing bug that crosses request rows, mis-broadcasts a
+what catches a packing bug that crosses request rows, wrongly broadcasts a
 per-request scale, or writes the wrong slice of the carried CFG correction.
 
 The stub DiT is elementwise, so this covers the packing and Euler-update
@@ -122,8 +122,7 @@ def test_padded_refresh_batch_matches_serial_per_request():
 
 def test_padded_reuse_batch_matches_serial_per_request():
     corrections = {
-        index: torch.full((_POOL_LATENT_LEN, _POOL_LATENT_DIM), float(index) - 1.5)
-        for index in range(_POOL_REQUESTS)
+        index: torch.full((_POOL_LATENT_LEN, _POOL_LATENT_DIM), float(index) - 1.5) for index in range(_POOL_REQUESTS)
     }
     indices = list(range(_POOL_REQUESTS))
     batched = _padded_batch_subset(indices, refresh=False, corrections=corrections)

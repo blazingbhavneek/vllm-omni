@@ -888,8 +888,54 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # process new reqs
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
-        for state in states:
-            if state.request_id in new_request_ids:
+        new_states = [state for state in states if state.request_id in new_request_ids]
+        failed_request_ids: set[str] = set()
+
+        # Pipelines that can encode several requests at once get the whole
+        # admission group in one call; every other pipeline keeps the original
+        # per-request path with per-request failure isolation. A batched
+        # encode call cannot isolate which request failed, so a failure there
+        # fails the whole admission group instead of just one request.
+        if len(new_states) > 1 and bool(getattr(self.pipeline, "supports_batched_prepare_encode", False)):
+            # Everything that runs before ``_dit_any_rank_failed`` must be
+            # inside the try: an exception on one rank would skip the
+            # all-reduce here while every peer proceeds into it, and the
+            # peers then hang on the NCCL collective until timeout.
+            per_req_exc: BaseException | None = None
+            try:
+                for state in new_states:
+                    self._initialize_generator(state.sampling)
+                clear_pipeline_stage_durations(self.pipeline)
+                self.pipeline.prepare_encode_batch(new_states)
+                prepare_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+                for state in new_states:
+                    merge_stage_durations(state, prepare_stage_durations)
+            except Exception as exc:
+                per_req_exc = exc
+            if _dit_any_rank_failed(per_req_exc is not None):
+                if per_req_exc is None:
+                    per_req_exc = RuntimeError(
+                        "Stepwise batched preparation failed on another DiT rank for the admission group"
+                    )
+                logger.error(
+                    "Stepwise batched request preparation failed for %d request(s): %s",
+                    len(new_states),
+                    per_req_exc,
+                    exc_info=isinstance(per_req_exc, Exception),
+                )
+                for state in new_states:
+                    self.state_cache.pop(state.request_id, None)
+                    failed_request_ids.add(state.request_id)
+                    error_outputs.append(
+                        RunnerOutput(
+                            request_id=state.request_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(per_req_exc),
+                        )
+                    )
+        else:
+            for state in new_states:
                 # Everything that runs before ``_dit_any_rank_failed`` must be
                 # inside the try: an exception in ``_initialize_generator`` or
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
@@ -925,6 +971,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         per_req_exc,
                         exc_info=isinstance(per_req_exc, Exception),
                     )
+                    failed_request_ids.add(state.request_id)
                     error_outputs.append(
                         RunnerOutput(
                             request_id=state.request_id,
@@ -933,8 +980,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             result=DiffusionOutput.from_exception(per_req_exc),
                         )
                     )
-                    continue
-            prepared_states.append(state)
+
+        prepared_states = [state for state in states if state.request_id not in failed_request_ids]
 
         if not prepared_states or not build_batch:
             return prepared_states, None, error_outputs
