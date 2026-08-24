@@ -10,13 +10,12 @@ CUDA_VISIBLE_DEVICES="" python -m pytest -q \
 ```
 
 For a local vLLM-Omni model smoke test, install the runtime extra in the
-vLLM-Omni environment:
+vLLM-Omni environment and run the end-to-end suite against a local checkpoint:
 
 ```bash
 pip install -e ".[irodori-tts]"
-python examples/offline_inference/text_to_speech/irodori_tts/end2end.py \
-  --text "こんにちは。これは音声合成のテストです。" \
-  --seconds 4
+VLLM_OMNI_IRODORI_TEST_MODEL=<local-checkpoint-dir> python -m pytest -q -s \
+  tests/diffusion/models/irodori_tts/test_irodori_batching_e2e.py
 ```
 
 ## Comparing with the official implementation
