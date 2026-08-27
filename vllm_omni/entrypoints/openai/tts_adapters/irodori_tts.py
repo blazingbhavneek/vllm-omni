@@ -28,6 +28,14 @@ _NUMERIC_OPTIONS: dict[str, tuple[float, float, bool]] = {
     "cfg_refresh_interval": (1, 100, True),
 }
 
+# vLLM-Omni's shared ``_resolve_ref_audio`` cap is 30s; Irodori checkpoints
+# declare their own bound in ``config_json.ref_max_seconds`` (120.0 for
+# v4-Small and v4.1-Small). This is the widest value we admit at the entrypoint
+# so a valid clip is not rejected before the pipeline sees it; the pipeline
+# then enforces the loaded checkpoint's actual ``max_ref_seconds``.
+_MAX_REF_SECONDS = 120.0
+_MIN_REF_SECONDS = 1.0
+
 _FORWARDED_EXTRAS = frozenset(
     {
         "seconds",
@@ -118,10 +126,14 @@ class IrodoriTTSAdapter(DiffusionTTSAdapter):
         if refs is not None:
             ref_list = [refs] if isinstance(refs, str) else refs
             assert isinstance(ref_list, list)  # validated above
-            resolved = await self.ctx.server._resolve_ref_audio_many(ref_list, min_duration=1.0, max_duration=120.0)
+            resolved = await self.ctx.server._resolve_ref_audio_many(
+                ref_list,
+                min_duration=_MIN_REF_SECONDS,
+                max_duration=_MAX_REF_SECONDS,
+            )
             total_duration = sum(len(wav) / sr for wav, sr in resolved)
-            if total_duration > 120.0:
-                raise ValueError("Combined Irodori-TTS reference audio must be at most 120 seconds.")
+            if total_duration > _MAX_REF_SECONDS:
+                raise ValueError(f"Combined Irodori-TTS reference audio must be at most {_MAX_REF_SECONDS:g} seconds.")
             prompt["ref_audio"] = [(np.asarray(wav, dtype=np.float32), sr) for wav, sr in resolved]
         return PreparedRequest(prompt=prompt, model_type=self.name)
 

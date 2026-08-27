@@ -26,7 +26,6 @@ DEFAULT_LATENT_BUCKET_SECONDS = tuple(float(seconds) for seconds in range(2, 31,
 DEFAULT_CONTEXT_BUCKET_TOKENS = (8, 16, 32, 64, 128, 256, 512, 1024)
 IRODORI_PRECISION_ENV = "VLLM_OMNI_IRODORI_PRECISION"
 IRODORI_FUSED_PROJECTIONS_ENV = "VLLM_OMNI_IRODORI_FUSED_PROJECTIONS"
-IRODORI_BATCH_PREPARE_ENV = "VLLM_OMNI_IRODORI_BATCH_PREPARE_ENCODE"
 
 
 def _environment_bool(name: str, *, default: bool) -> bool:
@@ -117,7 +116,6 @@ class IrodoriBatchingConfig:
     cfg_refresh_interval: int
     precision_policy: IrodoriPrecisionPolicy
     fuse_linear_projections: bool
-    batch_prepare_encode: bool
 
     @classmethod
     def from_od_config(cls, od_config: Any) -> IrodoriBatchingConfig:
@@ -141,16 +139,6 @@ class IrodoriBatchingConfig:
         )
         if any(right <= left for left, right in zip(context_tokens, context_tokens[1:])):
             raise ValueError("irodori_context_bucket_tokens must be strictly increasing.")
-
-        if "irodori_batch_prepare_encode" in extras:
-            batch_prepare_encode = extras["irodori_batch_prepare_encode"]
-            if not isinstance(batch_prepare_encode, bool):
-                raise ValueError("irodori_batch_prepare_encode must be a boolean.")
-        else:
-            batch_prepare_encode = _environment_bool(
-                IRODORI_BATCH_PREPARE_ENV,
-                default=True,
-            )
 
         if "irodori_fuse_linear_projections" in extras:
             fuse_linear_projections = extras["irodori_fuse_linear_projections"]
@@ -179,13 +167,6 @@ class IrodoriBatchingConfig:
                 )
             ),
             fuse_linear_projections=fuse_linear_projections,
-            # Encoding a whole admission group in one pass shifts the encoder
-            # output by a couple of bf16 ulp, which is invisible for a request
-            # that pins ``seconds`` but can move a *predicted* duration across
-            # a rounding boundary — at most one codec frame either way. Set
-            # False when a deployment needs predicted lengths to be identical
-            # regardless of what else is in flight.
-            batch_prepare_encode=batch_prepare_encode,
             # 1 recomputes every CFG branch on every step, matching the
             # reference sampler exactly.  Higher values reuse the last
             # correction in between and trade fidelity for speed.

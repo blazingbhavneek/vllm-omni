@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import os
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -103,22 +103,6 @@ class _IrodoriRequestPlan:
     has_reference: bool
 
 
-def _pad_reference_rows(value: torch.Tensor, usable: int, target: int) -> torch.Tensor:
-    """Trim one reference to its whole speaker patches, then pad to ``target``.
-
-    ``patch_sequence_with_mask`` drops the partial tail patch and folds the
-    mask with ``all()`` over each window, so trimming to ``usable`` first
-    reproduces the serial patching exactly and the appended zero rows become
-    whole patches that mask out.
-    """
-    value = value[:, :usable]
-    if value.shape[1] == target:
-        return value
-    shape = list(value.shape)
-    shape[1] = target - value.shape[1]
-    return torch.cat((value, value.new_zeros(shape)), dim=1)
-
-
 class IrodoriTTSPipeline(
     nn.Module,
     SupportAudioOutput,
@@ -134,7 +118,6 @@ class IrodoriTTSPipeline(
     supports_request_batch: ClassVar[bool] = False
     supports_step_execution: ClassVar[bool] = True
     supports_fused_step_execution: ClassVar[bool] = True
-    supports_batched_prepare_encode: ClassVar[bool] = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 48000
     _dit_modules: ClassVar[list[str]] = ["model"]
@@ -194,7 +177,6 @@ class IrodoriTTSPipeline(
         self.packed_varlen_enabled = self.model.supports_packed_varlen_attention()
         # Shadows the class-level capability so a deployment can turn the
         # batched request setup off without touching the runner.
-        self.supports_batched_prepare_encode = self.batching_config.batch_prepare_encode
         logger.info(
             "Irodori parameter dtype=%s; precision profile %r "
             "(FP32 matmul policy): dit=%s codec=%s condition=%s attention=%s",
@@ -470,66 +452,6 @@ class IrodoriTTSPipeline(
             options["duration_scale"],
         )
 
-    def _duration_lengths_batch(
-        self,
-        plans: list[_IrodoriRequestPlan],
-        condition: IrodoriConditionState,
-    ) -> list[IrodoriLengthState]:
-        """Resolve every request's output length, predicting in one forward.
-
-        ``condition`` is the batched condition state, row ``i`` belonging to
-        ``plans[i]``. Requests that pinned ``seconds`` need no forward at all;
-        the rest are gathered into a single duration-predictor call so a wave
-        costs one launch and one device sync instead of one per request.
-        """
-        lengths: list[IrodoriLengthState | None] = [None] * len(plans)
-        pending = [index for index, plan in enumerate(plans) if plan.options["seconds"] is None]
-        for index, plan in enumerate(plans):
-            if plan.options["seconds"] is not None:
-                lengths[index] = self._fixed_duration_lengths(plan.options)
-        if pending:
-            rows = torch.tensor(pending, device=self.device, dtype=torch.long)
-
-            def select(value: torch.Tensor | None) -> torch.Tensor | None:
-                return None if value is None else value.index_select(0, rows)
-
-            text_mask = select(condition.text_mask)
-            caption_mask = select(condition.caption_mask)
-            assert text_mask is not None
-            has_reference = [plans[index].has_reference for index in pending]
-            features = build_duration_features(
-                [plans[index].text for index in pending],
-                token_counts=text_mask.sum(dim=1),
-                max_text_len=self.checkpoint_config.max_text_len,
-                has_speaker=has_reference,
-            ).to(self.device)
-            prediction = self.model.predict_duration_log_frames(
-                text_state=select(condition.text_state),
-                text_mask=text_mask,
-                speaker_state=select(condition.speaker_state),
-                speaker_mask=select(condition.speaker_mask),
-                caption_state=select(condition.caption_state),
-                caption_mask=caption_mask,
-                duration_features=features,
-                has_speaker=torch.tensor(has_reference, device=self.device),
-                has_caption=(
-                    torch.zeros(len(pending), dtype=torch.bool, device=self.device)
-                    if caption_mask is None
-                    else caption_mask.any(dim=1)
-                ),
-            )
-            # One sync for the whole group; the per-request path means over the
-            # same trailing axes, so the values are identical.
-            frames = torch.expm1(prediction).reshape(len(pending), -1).mean(dim=1).tolist()
-            for position, index in enumerate(pending):
-                lengths[index] = self._predicted_duration_lengths(
-                    frames[position],
-                    plans[index].options["duration_scale"],
-                )
-        if any(length is None for length in lengths):
-            raise RuntimeError("Irodori batched duration resolution left a request without lengths.")
-        return [length for length in lengths if length is not None]
-
     def _plan_request(self, prompt: Any, sampling: Any) -> _IrodoriRequestPlan:
         """Resolve one request's prompt, options, tokens, and reference audio.
 
@@ -616,75 +538,6 @@ class IrodoriTTSPipeline(
             caption_mask=plan.caption_mask,
         )
 
-    def _reference_usable_length(self, plan: _IrodoriRequestPlan) -> int | None:
-        """Whole-patch reference length, or ``None`` if it has no whole patch.
-
-        A reference shorter than one speaker patch makes ``patch_sequence_with_mask``
-        raise. Padding it inside a batch would hide that error, so such a group
-        falls back to the per-request path and fails exactly as it does alone.
-        """
-        patch_size = int(self.checkpoint_config.model.speaker_patch_size)
-        if patch_size <= 1:
-            return int(plan.ref_latent.shape[1])
-        usable = (int(plan.ref_latent.shape[1]) // patch_size) * patch_size
-        return usable if usable > 0 else None
-
-    def _encode_conditions_batch(self, plans: list[_IrodoriRequestPlan]) -> IrodoriConditionState | None:
-        """Encode a whole admission group in one pass, or ``None`` if it cannot.
-
-        Text and caption already carry fixed padded widths, so only the
-        reference latents need aligning; each is trimmed to its whole speaker
-        patches and zero-padded to the group width, which the speaker mask then
-        excludes.
-        """
-        usable_lengths = [self._reference_usable_length(plan) for plan in plans]
-        if any(usable is None for usable in usable_lengths):
-            return None
-        reference_width = max(usable for usable in usable_lengths if usable is not None)
-        return encode_irodori_conditions(
-            self.model,
-            torch.cat([plan.text_ids for plan in plans], dim=0),
-            torch.cat([plan.text_mask for plan in plans], dim=0),
-            torch.cat(
-                [
-                    _pad_reference_rows(plan.ref_latent, usable, reference_width)
-                    for plan, usable in zip(plans, usable_lengths, strict=True)
-                    if usable is not None
-                ],
-                dim=0,
-            ),
-            torch.cat(
-                [
-                    _pad_reference_rows(plan.ref_mask, usable, reference_width)
-                    for plan, usable in zip(plans, usable_lengths, strict=True)
-                    if usable is not None
-                ],
-                dim=0,
-            ),
-            caption_input_ids=torch.cat([plan.caption_ids for plan in plans], dim=0),
-            caption_mask=torch.cat([plan.caption_mask for plan in plans], dim=0),
-        )
-
-    @staticmethod
-    def _condition_row(condition: IrodoriConditionState, index: int) -> IrodoriConditionState:
-        """Copy one request's rows out of a batched condition state.
-
-        The copy is deliberate: a view would keep the whole group's encoder
-        output alive for as long as the slowest request in it.
-        """
-
-        def row(value: torch.Tensor | None) -> torch.Tensor | None:
-            return None if value is None else value[index : index + 1].contiguous()
-
-        return IrodoriConditionState(
-            text_state=row(condition.text_state),
-            text_mask=row(condition.text_mask),
-            speaker_state=row(condition.speaker_state),
-            speaker_mask=row(condition.speaker_mask),
-            caption_state=row(condition.caption_state),
-            caption_mask=row(condition.caption_mask),
-        )
-
     def _prepare_request(self, prompt: Any, sampling: Any) -> _IrodoriPreparedRequest:
         plan = self._plan_request(prompt, sampling)
         condition = self._encode_plan(plan)
@@ -733,43 +586,6 @@ class IrodoriTTSPipeline(
     def prepare_encode(self, state: StepRequestState, **_: Any) -> StepRequestState:
         """Prepare one request's conditions, noise, schedule, and static K/V."""
         return self._install_prepared(state, self._prepare_request(state.prompt, state.sampling))
-
-    def prepare_encode_batch(self, states: Sequence[StepRequestState], **_: Any) -> Sequence[StepRequestState]:
-        """Prepare every request admitted in one scheduler step together.
-
-        The condition encoders and the duration predictor dominate request
-        setup and are the only parts that batch, so they run once for the whole
-        group; noise, schedule, and the static context K/V stay per request
-        because each one is sized by that request's own output length.
-
-        A group of one takes the per-request path unchanged, which is what
-        keeps a single-request wave bit-identical to a serial render.
-        """
-        states = list(states)
-        if len(states) <= 1:
-            for state in states:
-                self.prepare_encode(state)
-            return states
-        plans = [self._plan_request(state.prompt, state.sampling) for state in states]
-        condition = self._encode_conditions_batch(plans)
-        if condition is None:
-            for state, plan in zip(states, plans, strict=True):
-                encoded = self._encode_plan(plan)
-                lengths = self._duration_lengths(
-                    text=plan.text,
-                    condition=encoded,
-                    has_reference=plan.has_reference,
-                    options=plan.options,
-                )
-                self._install_prepared(state, self._build_prepared(plan, encoded, lengths))
-            return states
-        lengths_list = self._duration_lengths_batch(plans, condition)
-        for index, (state, plan, lengths) in enumerate(zip(states, plans, lengths_list, strict=True)):
-            self._install_prepared(
-                state,
-                self._build_prepared(plan, self._condition_row(condition, index), lengths),
-            )
-        return states
 
     def get_step_execution_key(
         self,

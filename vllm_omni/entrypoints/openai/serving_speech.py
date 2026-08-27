@@ -409,9 +409,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._tts_stage = None
         instance._adapter = None
         instance._init_speaker_storage()
-        instance._adapter = None
         adapter_cls = resolve_adapter(instance._tts_model_type)
         if adapter_cls is not None:
+            # No ``load_capabilities()`` here: its loaders read
+            # ``engine_client.model_config``, which a diffusion-only instance
+            # does not have. The ``TTSCapabilities()`` defaults from
+            # ``__init__`` are already correct for a pure-diffusion pipeline.
             instance._adapter = adapter_cls(SpeechServingContext(server=instance, diffusion_engine=diffusion_engine))
         return instance
 
@@ -1724,32 +1727,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
-        if min_duration < 0 or max_duration <= 0 or min_duration > max_duration:
-            raise ValueError(f"Invalid reference duration bounds: {min_duration=} {max_duration=}.")
-
-        def validate_duration(wav: list[float], sample_rate: int) -> None:
-            if sample_rate <= 0:
-                raise ValueError(f"Reference audio has invalid sample rate {sample_rate}.")
-            duration = len(wav) / sample_rate
-            if duration < min_duration:
-                raise ValueError(
-                    f"Reference audio too short ({duration:.1f}s). "
-                    f"At least {min_duration:g}s of clear speech is required."
-                )
-            if duration > max_duration:
-                raise ValueError(
-                    f"Reference audio too long ({duration:.1f}s). "
-                    f"Maximum {max_duration:g}s supported — use a shorter clip."
-                )
-
         cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
             wav_list, sr, _, _ = cached
-            # Bounds intentionally remain outside the cache key, so enforce
-            # them on cache hits as well as new fetches.
-            validate_duration(wav_list, sr)
             logger.debug(
                 "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
                 len(wav_list),
@@ -1776,11 +1758,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sr = int(sr)
         artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
-        # Convert once so cache and fetch validation run through the identical
-        # calculation and error path.
+        if duration < min_duration:
+            raise ValueError(
+                f"Reference audio too short ({duration:.1f}s). At least {min_duration:g}s of clear speech is required."
+            )
+        if duration > max_duration:
+            raise ValueError(
+                f"Reference audio too long ({duration:.1f}s). Maximum {max_duration:g}s supported — use a shorter clip."
+            )
         tolist_start_s = time.perf_counter()
         wav_list = wav_np.tolist()
-        validate_duration(wav_list, sr)
         tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
         logger.debug(
             "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",

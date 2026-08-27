@@ -38,12 +38,10 @@ reads as ``max_num_running_reqs``). It is a Python-only knob today: the
 ``vllm serve`` path pins it to 1, so these tests use ``AsyncOmni`` rather than
 the HTTP server.
 
-Request setup batches too: every request admitted in one scheduler step goes
-through ``prepare_encode_batch``. That is exact for a request that pins
-``seconds``, and moves a *predicted* duration by at most one codec frame --
-``test_predicted_duration_stays_within_one_frame_across_wave_sizes`` is the
-guard on that bound, and ``irodori_batch_prepare_encode=False`` turns the
-behaviour off for deployments that need predicted lengths to be reproducible.
+Request setup does not batch: every request is encoded on its own through
+``prepare_encode``, so a predicted duration must not depend on what else is in
+flight at all. ``test_predicted_duration_is_identical_across_wave_sizes`` is
+the guard on that.
 
 Requires a GPU and the ``irodori-tts`` extra. Point at an already-downloaded
 checkpoint directory to avoid a Hub round-trip::
@@ -316,15 +314,13 @@ def test_mixed_length_wave_preserves_request_identity():
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
-def test_predicted_duration_stays_within_one_frame_across_wave_sizes():
+def test_predicted_duration_is_identical_across_wave_sizes():
     """A predicted length must not depend on what else is in flight.
 
     Requests that pin ``seconds`` get an exact sample count, asserted
-    elsewhere. Requests that let the model predict their length go through
-    ``prepare_encode_batch``, whose batched encoder output differs from the
-    serial one at the last bits — enough to move ``round()`` by one codec
-    frame, and no further. This is the guard on "no further"; a regression that
-    genuinely crossed requests would blow past a single frame.
+    elsewhere. Requests that let the model predict their length are encoded one
+    at a time by ``prepare_encode``, so a wave must reproduce the serial render
+    exactly. Any drift at all means request setup leaked across requests.
     """
     indices = list(range(IDENTITY_REQUESTS))
 
@@ -346,10 +342,10 @@ def test_predicted_duration_stays_within_one_frame_across_wave_sizes():
             f"wave={wave_audio.shape[0]} drift={drift} samples "
             f"({drift / CODEC_HOP_SAMPLES:.2f} codec frames)"
         )
-        assert drift <= CODEC_HOP_SAMPLES, (
+        assert drift == 0, (
             f"request {index} predicted duration moved {drift} samples "
             f"({drift / CODEC_HOP_SAMPLES:.2f} codec frames) between a serial render and a wave; "
-            f"at most one frame is expected from batched request setup"
+            f"per-request setup must make a wave bit-identical to a serial render"
         )
 
 
